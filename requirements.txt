@@ -1,0 +1,2 @@
+pyserial>=3.5
+# tkinter comes with the OS Python (Debian/Ubuntu: apt install python3-tk)
