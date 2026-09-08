@@ -14,14 +14,15 @@ Verified hardware/protocol (firmware v11.27):
   * Straight-through cable into the port labeled RS-232 (not COMMAND/INPUT/etc).
 
 SAFETY MODEL
-  This driver defaults to dry_run=True. All commands that can ENERGIZE or MOVE a
-  motor (MON, MOVA, MOVR, JOG, HOME) are refused unless you explicitly arm() the
-  controller. In dry_run mode those methods return the exact command sequence they
-  WOULD send, so you can inspect motion plans without any risk. Read-only reports
-  and non-motion configuration (VEL/ACC/POS/SPOS) always execute. STOP/MOFF always
-  execute (stopping/de-energizing is always safe).
-  HOME is refused regardless of arming unless the controller is constructed
-  with home_switches=True. This machine has no home switches.
+  Every command passes through raw(), which is the single guard:
+  * RUN/NEW/SAVE/CONT are refused unless force=True. They run or destroy the
+    program stored in the controller's non-volatile memory.
+  * HOME is refused unless the controller is constructed with
+    home_switches=True. This machine has no home switches.
+  * Commands that energize or move a motor (MON, MOVA, MOVR, JOG, HOME) and
+    output-port commands are only logged, not sent, while dry_run is True.
+    The driver starts in dry run; call arm(confirm=True) to transmit them.
+  * Reads, VEL/ACC/POS/SPOS, STOP and MOFF are always sent.
 
 Move model (per OES reference):
   MON x                enable the axis driver
@@ -29,10 +30,17 @@ Move model (per OES reference):
   VEL x <steps/s>      set slew speed     (200 .. 200,000)
   POS x <value>        set target (for MOVA) / distance (for MOVR), +-2147483647
   MOVA x  |  MOVR x    begin absolute / relative move  -> "X Abs. Move" then "Done X"
+
+Progress messages go to the `oes` logger. Configure `logging` in the
+application to see them; with verbose=False they are emitted at DEBUG.
 """
 
 from __future__ import annotations
+
+import contextlib
+import logging
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 try:
@@ -40,46 +48,74 @@ try:
 except ImportError as e:
     raise SystemExit("pyserial is required: pip install pyserial") from e
 
+log = logging.getLogger("oes")
+
 
 class OESError(Exception):
     """Protocol / usage error talking to the controller."""
 
 
-# Command prefixes that can energize or move a motor -> gated behind arm().
+@dataclass
+class MoveResult:
+    """What a guarded motion call did. In dry run nothing was sent and
+    `responses` is None."""
+
+    dry_run: bool
+    description: str
+    commands: list[str]
+    responses: list[str] | None
+
+
+# Command prefixes that can energize or move a motor: simulated until arm().
 _ACTUATOR_PREFIXES = ("MON", "MOVA", "MOVR", "JOG", "HOME")
-# Always-safe commands (execute even in dry_run): stop / de-energize.
+# Stop / de-energize: always sent, even in dry run.
 _ALWAYS_SAFE_PREFIXES = ("STOP", "MOFF")
-# Commands that destroy stored state or run the stored program. These are
-# refused ALWAYS (arming does not unlock them) -- only raw(..., force=True).
+# Commands that run or destroy the stored program. Refused unless raw(..., force=True).
 #   RUN  : executes the stored program -> real motion AND output actuation
 #   NEW  : erases program memory ("Purging the memory")
-#   SAVE : overwrites non-volatile memory with current RAM program
+#   SAVE : overwrites non-volatile memory with the current RAM program
 #   CONT : resumes a PAUSEd program -> can resume motion
 _DESTRUCTIVE_PREFIXES = ("RUN", "NEW", "SAVE", "CONT")
-# Commands that drive the physical output port (solenoid/relay/tool). Gated
-# behind arm() -- the previous owner's program uses output bit 2 for an
-# unidentified end-effector.
+# Commands that drive the physical output port (solenoid/relay/tool). The previous
+# owner's program used output bit 2 for an unidentified end-effector.
 _OUTPUT_PREFIXES = ("OUT", "SETBIT", "CLRBIT", "PWM")
 
-VEL_MIN, VEL_MAX = 200, 200_000  # steps / sec
-ACC_MIN, ACC_MAX = 40_000, 40_000_000  # steps / sec^2
+VEL_MIN, VEL_MAX = 200, 200_000  # steps/s; the firmware clamps silently outside this
+ACC_MIN, ACC_MAX = 40_000, 40_000_000  # steps/s^2
 POS_MIN, POS_MAX = -2_147_483_647, 2_147_483_647
+
+# Serial timing. The controller needs ~100 ms per command and drops replies when
+# polled faster than ~20 Hz.
+SERIAL_TIMEOUT_S = 0.05  # one read() call blocks at most this long
+RESET_PULSE_S = 0.05  # RTS held asserted; the manual asks for >= 10 ms
+BANNER_TIMEOUT_S = 2.5  # max wait for the reset banner
+BANNER_QUIET_S = 0.3  # banner is complete this long after its last byte
+REPLY_QUIET_S = 0.12  # a reply is complete this long after sending, once bytes arrived
+MIN_POLL_S = 0.05  # floor for status polling (~20 Hz)
+READ_CHUNK = 256
 
 
 class OESController:
-    AXES = ("X", "Y", "Z", "W")
+    """One controller on one serial port. Use it as a context manager. Opening
+    pulses RESET, which zeroes every step counter."""
+
+    AXES = ("X", "Y", "Z", "W")  # what the board can drive; W is absent on this machine
 
     def __init__(
         self,
         port: str = "/dev/ttyUSB0",
         baud: int = 19200,
         dry_run: bool = True,
-        axes=("X", "Y", "Z"),
+        axes: tuple[str, ...] = ("X", "Y", "Z"),
         cmd_wait: float = 0.20,
         verbose: bool = True,
         home_switches: bool = False,
-    ):
+    ) -> None:
         """
+        dry_run: start with motion commands simulated; see arm().
+        axes: the axes this machine actually has. Anything else is refused.
+        cmd_wait: longest wait for the reply to one command, in seconds.
+        verbose: emit progress at INFO (True) or DEBUG (False) on the `oes` logger.
         home_switches: whether home switches are wired to the controller's HOME
             inputs. This machine has NONE, so HOME is refused: it would drive
             the axis into a hard stop. Pass True only after switches are fitted
@@ -88,7 +124,7 @@ class OESController:
         self.port = port
         self.baud = baud
         self.dry_run = dry_run
-        self.axes = tuple(a.upper() for a in axes)
+        self.axes = tuple(axis.upper() for axis in axes)
         unknown = set(self.axes) - set(self.AXES)
         if unknown:
             raise OESError(f"unknown axes {sorted(unknown)}; the controller has {self.AXES}")
@@ -97,8 +133,9 @@ class OESController:
         self.home_switches = home_switches
         self.ser: serial.Serial | None = None
         self.banner = ""
-        self.version = None
+        self.version: str | None = None
 
+    # ------------------------------------------------------------- lifecycle
     def open(self, tries: int = 3) -> OESController:
         """Open the port and run the RESET handshake.
 
@@ -107,8 +144,8 @@ class OESController:
         adapter stays enumerated at the same bus address). Retry rather than
         failing the whole run.
         """
-        last = None
-        for i in range(tries):
+        last_error: Exception | None = None
+        for attempt in range(1, tries + 1):
             try:
                 self.ser = serial.Serial(
                     self.port,
@@ -116,7 +153,7 @@ class OESController:
                     bytesize=serial.EIGHTBITS,
                     parity=serial.PARITY_NONE,
                     stopbits=serial.STOPBITS_ONE,
-                    timeout=0.05,
+                    timeout=SERIAL_TIMEOUT_S,
                     rtscts=False,
                     dsrdtr=False,
                 )
@@ -124,60 +161,69 @@ class OESController:
                 self.reset()
                 return self
             except (serial.SerialException, OSError) as e:
-                last = e
-                self._log(f"open attempt {i + 1}/{tries} failed: {e}")
-                try:
-                    if self.ser:
+                last_error = e
+                log.warning("open attempt %d/%d failed: %s", attempt, tries, e)
+                if self.ser is not None:
+                    with contextlib.suppress(Exception):
                         self.ser.close()
-                except Exception:
-                    pass
                 self.ser = None
-                time.sleep(1.0 + i)
-        raise OESError(f"could not open {self.port} after {tries} tries: {last}")
+                time.sleep(attempt)
+        raise OESError(f"could not open {self.port} after {tries} tries: {last_error}")
 
     def reset(self) -> None:
-        """Documented RESET/init pulse on RTS (pin 7): SET >=10ms, then CLEAR.
-        NOTE: open() calls this, so every OESController() invocation resets the
-        board and ZEROES all step counters.
-        """
+        """Documented RESET/init pulse on RTS (pin 7): SET >= 10 ms, then CLEAR.
 
-        if not self.ser:
-            raise OESError("port not open")
-        self.ser.rts = True  # SET
-        time.sleep(0.05)  # >= 10 ms
-        self.ser.rts = False  # CLEAR (release reset; hold clear)
+        NOTE: open() calls this, so every OESController() invocation resets the
+        board and ZEROES all step counters. (A bare port close does NOT reset --
+        verified -- but our open deliberately does.) On this open-loop machine
+        the counters therefore read 0 at the start of every script run,
+        regardless of where the axes physically are. Never infer physical
+        position from a counter across script invocations.
+        """
+        ser = self._require_port()
+        ser.rts = True
+        time.sleep(RESET_PULSE_S)
+        ser.rts = False  # release reset; stays clear for the whole session
         # The firmware prints "Version xx.yy" then "Joystick is on" after every
-        # reset, including the pulse just sent. Wait up to ~2.5 s for it, but
-        # stop ~0.3 s after the last byte so a normal boot does not stall.
+        # reset, including the pulse just sent. Wait up to BANNER_TIMEOUT_S for
+        # it, but stop BANNER_QUIET_S after the last byte so a normal boot does
+        # not stall.
         buf = bytearray()
-        t0 = time.time()
-        last = t0
-        while time.time() - t0 < 2.5:
-            c = self.ser.read(256)
-            if c:
-                buf.extend(c)
-                last = time.time()
+        start = time.monotonic()
+        last_byte_at = start
+        while time.monotonic() - start < BANNER_TIMEOUT_S:
+            chunk = ser.read(READ_CHUNK)
+            if chunk:
+                buf.extend(chunk)
+                last_byte_at = time.monotonic()
                 if b"Version" in buf and buf.count(b"\n") >= 2:
                     break
-            elif buf and (time.time() - last) > 0.3:
+            elif buf and time.monotonic() - last_byte_at > BANNER_QUIET_S:
                 break
         self.banner = buf.decode("latin-1", "replace").strip()
+        self.version = None
         if "Version" in self.banner:
-            try:
-                self.version = self.banner.split("Version", 1)[1].split()[0]
-            except IndexError:
-                self.version = None
+            words = self.banner.split("Version", 1)[1].split()
+            self.version = words[0] if words else None
 
     def close(self) -> None:
-        if self.ser:
+        if self.ser is not None:
             self.ser.close()
             self.ser = None
 
-    def __enter__(self):
+    def __enter__(self) -> OESController:
         return self.open()
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _require_port(self) -> serial.Serial:
+        if self.ser is None:
+            raise OESError("port not open")
+        return self.ser
+
+    def _log(self, msg: str, *args: object) -> None:
+        log.log(logging.INFO if self.verbose else logging.DEBUG, msg, *args)
 
     # ------------------------------------------------------------- low level io
     def raw(self, cmd: str, wait: float | None = None, force: bool = False) -> str:
@@ -193,8 +239,7 @@ class OESController:
           * reads, VEL/ACC/POS/SPOS, STOP and MOFF are always sent.
         An empty reply is normal for most set commands and means success.
         """
-        if not self.ser:
-            raise OESError("port not open")
+        ser = self._require_port()
         head = _command_head(cmd)
         kind = classify_command(cmd)
         if kind == "destructive" and not force:
@@ -209,32 +254,27 @@ class OESController:
                 f"OESController(home_switches=True) only once they are fitted."
             )
         if kind in ("actuator", "output") and self.dry_run:
-            self._log(f"[DRY-RUN] would send {cmd.strip()!r}")
+            self._log("[DRY-RUN] would send %r", cmd.strip())
             return ""
         wait = self.cmd_wait if wait is None else wait
-        payload = (cmd.strip() + "\r").encode("latin-1")
-        self.ser.reset_input_buffer()
-        self.ser.write(payload)
-        self.ser.flush()
+        ser.reset_input_buffer()
+        ser.write((cmd.strip() + "\r").encode("latin-1"))
+        ser.flush()
         buf = bytearray()
-        t0 = time.time()
-        while time.time() - t0 < wait:
-            c = self.ser.read(256)
-            if c:
-                buf.extend(c)
-            elif buf and (time.time() - t0) > 0.12:
+        start = time.monotonic()
+        while time.monotonic() - start < wait:
+            chunk = ser.read(READ_CHUNK)
+            if chunk:
+                buf.extend(chunk)
+            elif buf and time.monotonic() - start > REPLY_QUIET_S:
                 break
         return buf.decode("latin-1", "replace").strip()
 
     def _check_axis(self, axis: str) -> str:
-        a = axis.upper()
-        if a not in self.axes:
+        axis = axis.upper()
+        if axis not in self.axes:
             raise OESError(f"invalid axis {axis!r}; this controller drives {self.axes}")
-        return a
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(msg)
+        return axis
 
     # ------------------------------------------------------------------- guard
     def arm(self, confirm: bool = False) -> None:
@@ -248,17 +288,17 @@ class OESController:
         self.dry_run = True
         self._log("controller disarmed (dry-run); motion commands are simulated")
 
-    def _run_sequence(self, commands: list[str], desc: str) -> dict:
-        """Execute (or, in dry_run, simulate) a motion command sequence."""
+    def _run_sequence(self, commands: list[str], description: str) -> MoveResult:
+        """Send a motion command sequence, or in dry run only log it."""
         if self.dry_run:
-            self._log(f"[DRY-RUN] {desc}: would send -> {commands}")
-            return {"dry_run": True, "desc": desc, "commands": commands, "responses": None}
+            self._log("[DRY-RUN] %s: would send -> %s", description, commands)
+            return MoveResult(True, description, commands, None)
         responses = []
-        for c in commands:
-            r = self.raw(c)
-            responses.append(r)
-            self._log(f"  -> {c!r}: {r!r}")
-        return {"dry_run": False, "desc": desc, "commands": commands, "responses": responses}
+        for command in commands:
+            reply = self.raw(command)
+            responses.append(reply)
+            self._log("  -> %r: %r", command, reply)
+        return MoveResult(False, description, commands, responses)
 
     # --------------------------------------------------------------- read-only
     def _read_int(self, cmd: str, prefix: str | None = None, tries: int = 4) -> int:
@@ -268,29 +308,29 @@ class OESController:
         answer (~100 ms/command). A single dropped reply must NOT abort a
         move-completion poll, so retry before giving up.
         """
-        last = None
-        for i in range(tries):
-            resp = self.raw(cmd)
+        last_error: OESError | None = None
+        for attempt in range(1, tries + 1):
+            reply = self.raw(cmd)
             try:
-                return self._parse_signed(resp, expect_prefix=prefix)
+                return self._parse_signed(reply, expect_prefix=prefix)
             except OESError as e:
-                last = e
-                time.sleep(0.05 * (i + 1))  # let the board catch up
-        raise OESError(f"{cmd}: no parseable reply after {tries} tries ({last})")
+                last_error = e
+                time.sleep(MIN_POLL_S * attempt)  # back off, let the board catch up
+        raise OESError(f"{cmd}: no parseable reply after {tries} tries ({last_error})")
 
     def report_position(self, axis: str) -> int:
         """R<axis> -> current step counter. Reply like 'X+0'."""
-        a = self._check_axis(axis)
-        return self._read_int(f"R{a}", prefix=a)
+        axis = self._check_axis(axis)
+        return self._read_int(f"R{axis}", prefix=axis)
 
-    def get_positions(self) -> dict:
-        return {a: self.report_position(a) for a in self.axes}
+    def get_positions(self) -> dict[str, int]:
+        return {axis: self.report_position(axis) for axis in self.axes}
 
     def axis_status(self, axis: str) -> int:
         """RSTS<axis> -> 32-bit axis status word. Bit 0 = 1 moving / 0 idle;
         bits 16-23 = analog channel value; RSTSX bits 8-11 = joystick keys."""
-        a = self._check_axis(axis)
-        return self._read_int(f"RSTS{a}")
+        axis = self._check_axis(axis)
+        return self._read_int(f"RSTS{axis}")
 
     def is_moving(self, axis: str) -> bool:
         """True if the axis is in MOVE mode (status-word bit 0)."""
@@ -307,80 +347,75 @@ class OESController:
         return self.raw("MSGON" if on else "MSGOFF")
 
     @staticmethod
-    def _parse_signed(resp: str, expect_prefix: str | None = None) -> int:
-        s = resp.strip()
-        if expect_prefix and s[:1].upper() == expect_prefix.upper():
-            s = s[1:]
-        s = s.split()[0] if s.split() else s
+    def _parse_signed(reply: str, expect_prefix: str | None = None) -> int:
+        """'X+1000' -> 1000 (with expect_prefix 'X'), '-5' -> -5."""
+        text = reply.strip()
+        if expect_prefix and text[:1].upper() == expect_prefix.upper():
+            text = text[1:]
+        words = text.split()
+        first = words[0] if words else text
         try:
-            return int(s.replace("+", ""))
+            return int(first.replace("+", ""))
         except ValueError as e:
-            raise OESError(f"could not parse numeric response {resp!r}") from e
+            raise OESError(f"could not parse numeric response {reply!r}") from e
 
     # --------------------------------------------- non-motion configuration
     def set_velocity(self, axis: str, steps_per_sec: int) -> str:
-        a = self._check_axis(axis)
-        if not (VEL_MIN <= steps_per_sec <= VEL_MAX):
-            raise OESError(f"velocity {steps_per_sec} out of range [{VEL_MIN}, {VEL_MAX}] steps/s")
-        return self.raw(f"VEL{a} {int(steps_per_sec)}")
+        axis = self._check_axis(axis)
+        self._validate_vel(steps_per_sec)
+        return self.raw(f"VEL{axis} {int(steps_per_sec)}")
 
     def set_acceleration(self, axis: str, steps_per_sec2: int) -> str:
-        a = self._check_axis(axis)
-        if not (ACC_MIN <= steps_per_sec2 <= ACC_MAX):
-            raise OESError(
-                f"acceleration {steps_per_sec2} out of range [{ACC_MIN}, {ACC_MAX}] steps/s^2"
-            )
-        return self.raw(f"ACC{a} {int(steps_per_sec2)}")
+        axis = self._check_axis(axis)
+        self._validate_acc(steps_per_sec2)
+        return self.raw(f"ACC{axis} {int(steps_per_sec2)}")
 
     def set_move_operand(self, axis: str, value: int) -> str:
         """POS<axis>: target position (for MOVA) or distance (for MOVR)."""
-        a = self._check_axis(axis)
-        if not (POS_MIN <= value <= POS_MAX):
-            raise OESError(f"position/distance {value} out of 32-bit range")
-        return self.raw(f"POS{a} {int(value)}")
+        axis = self._check_axis(axis)
+        self._validate_pos(value, "position/distance")
+        return self.raw(f"POS{axis} {int(value)}")
 
     def redefine_position(self, axis: str, value: int = 0) -> str:
         """SPOS<axis>: redefine the current step counter (like G92). No motion."""
-        a = self._check_axis(axis)
-        if not (POS_MIN <= value <= POS_MAX):
-            raise OESError(f"value {value} out of 32-bit range")
-        return self.raw(f"SPOS{a} {int(value)}")
+        axis = self._check_axis(axis)
+        self._validate_pos(value, "value")
+        return self.raw(f"SPOS{axis} {int(value)}")
 
     # ---------------------------------------------------- guarded motion API
-    def motor_on(self, axis: str) -> dict:
-        a = self._check_axis(axis)
-        return self._run_sequence([f"MON{a}"], f"enable {a} motor")
+    def motor_on(self, axis: str) -> MoveResult:
+        axis = self._check_axis(axis)
+        return self._run_sequence([f"MON{axis}"], f"enable {axis} motor")
 
     def motor_off(self, axis: str) -> str:
         """Always executes (de-energizing is safe)."""
-        a = self._check_axis(axis)
-        return self.raw(f"MOFF{a}")
+        axis = self._check_axis(axis)
+        return self.raw(f"MOFF{axis}")
 
     def _move(
         self,
-        a: str,
+        axis: str,
         mnemonic: str,
         value: int,
         vel: int | None,
         acc: int | None,
         enable: bool,
-        desc: str,
-    ) -> dict:
+        description: str,
+    ) -> MoveResult:
         """Shared body of move_absolute / move_relative: MON, ACC, VEL, POS, then
         the move mnemonic. Returns as soon as the controller acknowledges."""
-        if not (POS_MIN <= value <= POS_MAX):
-            raise OESError(f"{desc}: {value} out of 32-bit range")
-        seq = []
+        self._validate_pos(value, description)
+        commands = []
         if enable:
-            seq.append(f"MON{a}")
+            commands.append(f"MON{axis}")
         if acc is not None:
             self._validate_acc(acc)
-            seq.append(f"ACC{a} {int(acc)}")
+            commands.append(f"ACC{axis} {int(acc)}")
         if vel is not None:
             self._validate_vel(vel)
-            seq.append(f"VEL{a} {int(vel)}")
-        seq += [f"POS{a} {int(value)}", f"{mnemonic}{a}"]
-        return self._run_sequence(seq, desc)
+            commands.append(f"VEL{axis} {int(vel)}")
+        commands += [f"POS{axis} {int(value)}", f"{mnemonic}{axis}"]
+        return self._run_sequence(commands, description)
 
     def move_absolute(
         self,
@@ -389,11 +424,13 @@ class OESController:
         vel: int | None = None,
         acc: int | None = None,
         enable: bool = True,
-    ) -> dict:
+    ) -> MoveResult:
         """MOVA: go to `target` steps from the current origin. Does not block;
         call wait_stopped() to wait for the move to end."""
-        a = self._check_axis(axis)
-        return self._move(a, "MOVA", target, vel, acc, enable, f"absolute move {a} -> {target}")
+        axis = self._check_axis(axis)
+        return self._move(
+            axis, "MOVA", target, vel, acc, enable, f"absolute move {axis} -> {target}"
+        )
 
     def move_relative(
         self,
@@ -402,36 +439,38 @@ class OESController:
         vel: int | None = None,
         acc: int | None = None,
         enable: bool = True,
-    ) -> dict:
+    ) -> MoveResult:
         """MOVR: move by `distance` steps (signed). Does not block; call
         wait_stopped() to wait for the move to end."""
-        a = self._check_axis(axis)
-        return self._move(a, "MOVR", distance, vel, acc, enable, f"relative move {a} by {distance}")
+        axis = self._check_axis(axis)
+        return self._move(
+            axis, "MOVR", distance, vel, acc, enable, f"relative move {axis} by {distance}"
+        )
 
-    def jog(self, axis: str, vel: int | None = None, enable: bool = True) -> dict:
+    def jog(self, axis: str, vel: int | None = None, enable: bool = True) -> MoveResult:
         """Continuous jog. Direction is the sign of the velocity. Stop with stop()."""
-        a = self._check_axis(axis)
-        seq = []
+        axis = self._check_axis(axis)
+        commands = []
         if enable:
-            seq.append(f"MON{a}")
+            commands.append(f"MON{axis}")
         if vel is not None:
-            self._validate_vel(abs(vel))
-            seq.append(f"VEL{a} {int(vel)}")
-        seq.append(f"JOG{a}")
-        return self._run_sequence(seq, f"jog {a}")
+            self._validate_vel(vel, allow_negative=True)
+            commands.append(f"VEL{axis} {int(vel)}")
+        commands.append(f"JOG{axis}")
+        return self._run_sequence(commands, f"jog {axis}")
 
-    def home(self, axis: str, enable: bool = True) -> dict:
+    def home(self, axis: str, enable: bool = True) -> MoveResult:
         """Homing sequence. Refused unless constructed with home_switches=True:
         this machine has no switches and the axis would drive into a hard stop
         with the gearbox multiplying the motor torque."""
-        a = self._check_axis(axis)
+        axis = self._check_axis(axis)
         if not self.home_switches:
             raise OESError(
-                f"HOME{a} refused: no home switches on this machine. Construct "
+                f"HOME{axis} refused: no home switches on this machine. Construct "
                 f"OESController(home_switches=True) only once they are fitted."
             )
-        seq = ([f"MON{a}"] if enable else []) + [f"HOME{a}"]
-        return self._run_sequence(seq, f"home {a}")
+        commands = ([f"MON{axis}"] if enable else []) + [f"HOME{axis}"]
+        return self._run_sequence(commands, f"home {axis}")
 
     def stop(self, axis: str | None = None) -> str:
         """STOP<axis> or STOPALL. ALWAYS executes -- stopping is always safe."""
@@ -461,19 +500,19 @@ class OESController:
         decides whether to STOP). A GUI uses it to check its abort flag and
         refresh the position display.
 
-        The poll interval is floored at 50 ms: the controller needs ~100 ms per
-        command and drops replies when polled faster than ~20 Hz. Up to
+        The poll interval is floored at MIN_POLL_S: the controller needs ~100 ms
+        per command and drops replies when polled faster than ~20 Hz. Up to
         `max_read_failures` consecutive unreadable replies are tolerated, then
         the OESError propagates.
         """
-        poll = max(poll, 0.05)
-        a = self._check_axis(axis)
-        t0 = time.time()
+        poll = max(poll, MIN_POLL_S)
+        axis = self._check_axis(axis)
+        start = time.monotonic()
         seen_moving = False
         failures = 0
-        while time.time() - t0 < timeout:
+        while time.monotonic() - start < timeout:
             try:
-                moving = bool(self.axis_status(a) & 0x1)
+                moving = bool(self.axis_status(axis) & 0x1)
                 failures = 0
             except OESError:
                 failures += 1
@@ -482,27 +521,37 @@ class OESController:
                 continue
             if moving:
                 seen_moving = True
-            elif seen_moving or time.time() - t0 > grace:
+            elif seen_moving or time.monotonic() - start > grace:
                 return True
             if on_poll is not None and on_poll():
                 return False
             time.sleep(poll)
         return False
 
-    def _validate_vel(self, v):
-        if not (VEL_MIN <= abs(v) <= VEL_MAX):
-            raise OESError(f"velocity {v} out of range [{VEL_MIN}, {VEL_MAX}]")
+    # -------------------------------------------------------------- validation
+    @staticmethod
+    def _validate_vel(vel: int, allow_negative: bool = False) -> None:
+        magnitude = abs(vel) if allow_negative else vel
+        if not VEL_MIN <= magnitude <= VEL_MAX:
+            raise OESError(f"velocity {vel} out of range [{VEL_MIN}, {VEL_MAX}] steps/s")
 
-    def _validate_acc(self, a):
-        if not (ACC_MIN <= a <= ACC_MAX):
-            raise OESError(f"acceleration {a} out of range [{ACC_MIN}, {ACC_MAX}]")
+    @staticmethod
+    def _validate_acc(acc: int) -> None:
+        if not ACC_MIN <= acc <= ACC_MAX:
+            raise OESError(f"acceleration {acc} out of range [{ACC_MIN}, {ACC_MAX}] steps/s^2")
+
+    @staticmethod
+    def _validate_pos(value: int, what: str) -> None:
+        if not POS_MIN <= value <= POS_MAX:
+            raise OESError(f"{what}: {value} out of 32-bit range")
 
 
 def _command_head(cmd: str) -> str:
     """Mnemonic of a command line: first token, upper-cased, digits stripped.
     'velz 5000' -> 'VELZ', 'STOPALL' -> 'STOPALL', 'setbit 2' -> 'SETBIT'."""
     head = "".join(ch for ch in cmd.strip().upper() if not ch.isdigit()).strip()
-    return head.split()[0] if head.split() else head
+    words = head.split()
+    return words[0] if words else head
 
 
 def classify_command(cmd: str) -> str:
@@ -522,11 +571,13 @@ def classify_command(cmd: str) -> str:
 
 
 if __name__ == "__main__":
-    # Quick self-test: connect, print version + positions (read-only).
-    with OESController() as oes:
-        print(f"banner : {oes.banner!r}")
-        print(f"version: {oes.version}")
-        print(f"joystick off: {oes.joystick(False)!r}")
-        print(f"positions   : {oes.get_positions()}")
+    # Quick self-test: connect, print version + positions (read-only), then show
+    # a dry-run motion plan without sending it.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    with OESController() as controller:
+        print(f"banner : {controller.banner!r}")
+        print(f"version: {controller.version}")
+        print(f"joystick off: {controller.joystick(False)!r}")
+        print(f"positions   : {controller.get_positions()}")
         print("\n--- dry-run motion plan (nothing sent) ---")
-        oes.move_relative("X", 2000, vel=5000, acc=200000)
+        print(controller.move_relative("X", 2000, vel=5000, acc=200000))

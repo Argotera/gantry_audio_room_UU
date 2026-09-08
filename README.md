@@ -39,6 +39,12 @@ Python 3.7+, pyserial, tkinter for the GUI. The user must be in the
 pip install -r requirements.txt
 ```
 
+The unit tests run against a fake serial port, so no hardware is needed:
+
+```bash
+python3 -m unittest -v
+```
+
 ## The GUI
 
 ```bash
