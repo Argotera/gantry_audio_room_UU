@@ -14,9 +14,9 @@ The steps/mm below are measured values for the complete drive train.
 
 So it is:
 
-X   105.2632 steps per mm   
+X   105.2632 steps per mm
 Y   210.5263 steps per mm
-Z   105.2632 steps per mm   
+Z   105.2632 steps per mm
 
 
 Controller:
@@ -43,7 +43,7 @@ set commands reply with nothing (empty == success).
 Speed should be restricted to <5000, preferably ~4000.
 
 Motion is ALWAYS LIVE! BE CAREFUL.
-CTRl+C kills the process but there is a ~0.2 sec delay! 
+CTRl+C kills the process but there is a ~0.2 sec delay!
 ONLY REAL KILL SWITCH IS YANKING THE POWER CORD!
 
 
@@ -69,6 +69,7 @@ Y 210.5263) and rounds to whole steps -- the residual is printed.
 
 
 """
+
 import argparse
 import time
 
@@ -77,14 +78,14 @@ try:
 except ImportError as e:
     raise SystemExit("pyserial is required: pip install pyserial") from e
 
-PORT = "/dev/ttyUSB0"                       # change to whatever serial is used
+PORT = "/dev/ttyUSB0"  # change to whatever serial is used
 
 # list serials by ls -l /sys/class/tty/*/device/driver
 
-BAUD = 19200                                # Bausrate used by the machine 
-AXES = ("X", "Y", "Z")                       # W is absent on this machine
+BAUD = 19200  # Bausrate used by the machine
+AXES = ("X", "Y", "Z")  # W is absent on this machine
 
-VEL_MIN, VEL_MAX = 200, 200_000              # firmware range (clamped silently)
+VEL_MIN, VEL_MAX = 200, 200_000  # firmware range (clamped silently)
 ACC_MIN, ACC_MAX = 40_000, 40_000_000
 POS_LIMIT = 2_147_483_647
 
@@ -93,7 +94,8 @@ POS_LIMIT = 2_147_483_647
 VEL_CEILING = {"X": 5000, "Y": 5000, "Z": 5000}
 
 STEPS_PER_MM = {"X": 105.2632, "Y": 210.5263, "Z": 105.2632}
-# calculated motor steps to actual physical movement 
+# calculated motor steps to actual physical movement
+
 
 class GantryError(Exception):
     pass
@@ -118,11 +120,16 @@ class Gantry:
         for i in range(tries):
             try:
                 self.ser = serial.Serial(
-                    self.port, self.baud, bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
-                    timeout=0.05, rtscts=False, dsrdtr=False,
+                    self.port,
+                    self.baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.05,
+                    rtscts=False,
+                    dsrdtr=False,
                 )
-                self.ser.dtr = False          # pin 4 is NC on the controller
+                self.ser.dtr = False  # pin 4 is NC on the controller
                 self._reset()
                 return self
             except (serial.SerialException, OSError) as e:
@@ -144,7 +151,7 @@ class Gantry:
         self.ser.rts = True
         time.sleep(0.05)
         self.ser.rts = False
-        buf = bytearray()                     # drain the boot banner
+        buf = bytearray()  # drain the boot banner
         t0 = last = time.time()
         while time.time() - t0 < 2.5:
             c = self.ser.read(256)
@@ -227,21 +234,36 @@ class Gantry:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Move one gantry axis by a relative distance (--mm) or step count (--steps).")
-    ap.add_argument("--axis", required=True, type=str.upper, choices=AXES,
-                    help="X, Y or Z. Required: no default, so nothing moves by accident.")
+        description="Move one gantry axis by a relative distance (--mm) or step count (--steps)."
+    )
+    ap.add_argument(
+        "--axis",
+        required=True,
+        type=str.upper,
+        choices=AXES,
+        help="X, Y or Z. Required: no default, so nothing moves by accident.",
+    )
     ap.add_argument("--steps", type=int, default=0, help="relative steps (signed)")
-    ap.add_argument("--mm", type=float, default=None,
-                    help="relative distance in mm (signed) -- converted with this "
-                         "axis's steps/mm. Use instead of --steps, not with it.")
+    ap.add_argument(
+        "--mm",
+        type=float,
+        default=None,
+        help="relative distance in mm (signed) -- converted with this "
+        "axis's steps/mm. Use instead of --steps, not with it.",
+    )
     ap.add_argument("--vel", type=int, default=1000, help="steps/s")
     ap.add_argument("--acc", type=int, default=40000, help="steps/s^2")
-    ap.add_argument("--home-counter", action="store_true",
-                    help="SPOS<axis> 0: redefine here as 0 (NO motion)")
-    ap.add_argument("--leave-energized", action="store_true",
-                    help="skip MOFF at the end (axis keeps holding torque)")
-    ap.add_argument("--force", action="store_true",
-                    help="allow --vel above the proven-clean ceiling")
+    ap.add_argument(
+        "--home-counter", action="store_true", help="SPOS<axis> 0: redefine here as 0 (NO motion)"
+    )
+    ap.add_argument(
+        "--leave-energized",
+        action="store_true",
+        help="skip MOFF at the end (axis keeps holding torque)",
+    )
+    ap.add_argument(
+        "--force", action="store_true", help="allow --vel above the proven-clean ceiling"
+    )
     ap.add_argument("--port", default=PORT)
     a = ap.parse_args()
 
@@ -257,7 +279,8 @@ def main():
         if a.mm and steps == 0:
             raise SystemExit(
                 f"--mm {a.mm} on {AX} rounds to 0 steps "
-                f"(one step is {1000 / STEPS_PER_MM[AX]:.2f} um)")
+                f"(one step is {1000 / STEPS_PER_MM[AX]:.2f} um)"
+            )
     else:
         steps = a.steps
 
@@ -272,11 +295,12 @@ def main():
         raise SystemExit(
             f"--vel {a.vel} is above the proven-clean ceiling for {AX} ({cap}).\n"
             f"Too fast stalls the motor and loses position SILENTLY. "
-            f"Pass --force if that is deliberate.")
+            f"Pass --force if that is deliberate."
+        )
 
     with Gantry(a.port) as g:
         print(f"connected: firmware {g.version}")
-        print(f"JOFF -> {g.raw('JOFF')!r}")     # board boots joystick-ENABLED
+        print(f"JOFF -> {g.raw('JOFF')!r}")  # board boots joystick-ENABLED
 
         if a.home_counter:
             g.raw(f"SPOS{AX} 0")
@@ -290,19 +314,25 @@ def main():
 
         mm = steps / STEPS_PER_MM[AX]
         est = abs(steps) / a.vel
-        print(f"MON{AX}/ACC/VEL -> {g.raw(f'MON{AX}')!r} "
-              f"{g.raw(f'ACC{AX} {a.acc}')!r} {g.raw(f'VEL{AX} {a.vel}')!r}")
+        print(
+            f"MON{AX}/ACC/VEL -> {g.raw(f'MON{AX}')!r} "
+            f"{g.raw(f'ACC{AX} {a.acc}')!r} {g.raw(f'VEL{AX} {a.vel}')!r}"
+        )
         p0 = g.position(AX)
-        print(f"\nmoving {AX} by {steps:+d} steps ({mm:+.3f} mm) "
-              f"at {a.vel} steps/s = {a.vel / STEPS_PER_MM[AX]:.1f} mm/s "
-              f"(~{est:.1f}s)")
+        print(
+            f"\nmoving {AX} by {steps:+d} steps ({mm:+.3f} mm) "
+            f"at {a.vel} steps/s = {a.vel / STEPS_PER_MM[AX]:.1f} mm/s "
+            f"(~{est:.1f}s)"
+        )
         if a.mm is not None:
             # Steps are integers, so the commanded distance is almost never
             # exactly the one asked for. Show the residual instead of quietly
             # absorbing it.
-            print(f"  requested {a.mm:+.3f} mm -> {exact:+.2f} steps, rounded "
-                  f"to {steps:+d} ({mm - a.mm:+.4f} mm off; one step on {AX} "
-                  f"is {1000 / STEPS_PER_MM[AX]:.2f} um)")
+            print(
+                f"  requested {a.mm:+.3f} mm -> {exact:+.2f} steps, rounded "
+                f"to {steps:+d} ({mm - a.mm:+.4f} mm off; one step on {AX} "
+                f"is {1000 / STEPS_PER_MM[AX]:.2f} um)"
+            )
         print(f"  counter before: {p0}")
         print(f"  POS{AX} -> {g.raw(f'POS{AX} {steps}')!r}")
 
@@ -318,13 +348,15 @@ def main():
                     seen = True
                 elif seen or (time.time() - t0) > 1.0:
                     break
-                time.sleep(0.05)              # >=20 Hz or replies get dropped
+                time.sleep(0.05)  # >=20 Hz or replies get dropped
             else:
                 print("  TIMEOUT waiting for the move to finish -> STOPALL")
                 g.stop_all()
         except KeyboardInterrupt:
-            print("\n  ^C -> STOPALL "
-                  "(0.2s of link latency! The real Emergency stop is the power switch!!!)")
+            print(
+                "\n  ^C -> STOPALL "
+                "(0.2s of link latency! The real Emergency stop is the power switch!!!)"
+            )
             g.stop_all()
 
         dt = time.time() - t0
@@ -335,7 +367,7 @@ def main():
             g.raw(f"MOFF{AX}")
             print(f"  MOFF{AX} sent")
         print(f"  positions: {g.positions()}")
-        back = (f"--mm {-a.mm:g}" if a.mm is not None else f"--steps {-steps}")
+        back = f"--mm {-a.mm:g}" if a.mm is not None else f"--steps {-steps}"
         print(f"\n  to return: --axis {AX} {back}")
 
 

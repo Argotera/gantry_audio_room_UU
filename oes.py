@@ -37,7 +37,7 @@ from typing import Callable
 
 try:
     import serial
-except ImportError as e:  
+except ImportError as e:
     raise SystemExit("pyserial is required: pip install pyserial") from e
 
 
@@ -61,18 +61,24 @@ _DESTRUCTIVE_PREFIXES = ("RUN", "NEW", "SAVE", "CONT")
 # unidentified end-effector.
 _OUTPUT_PREFIXES = ("OUT", "SETBIT", "CLRBIT", "PWM")
 
-VEL_MIN, VEL_MAX = 200, 200_000              # steps / sec
-ACC_MIN, ACC_MAX = 40_000, 40_000_000        # steps / sec^2
+VEL_MIN, VEL_MAX = 200, 200_000  # steps / sec
+ACC_MIN, ACC_MAX = 40_000, 40_000_000  # steps / sec^2
 POS_MIN, POS_MAX = -2_147_483_647, 2_147_483_647
 
 
 class OESController:
     AXES = ("X", "Y", "Z", "W")
 
-    def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 19200,
-                 dry_run: bool = True, axes=("X", "Y", "Z"),
-                 cmd_wait: float = 0.20, verbose: bool = True,
-                 home_switches: bool = False):
+    def __init__(
+        self,
+        port: str = "/dev/ttyUSB0",
+        baud: int = 19200,
+        dry_run: bool = True,
+        axes=("X", "Y", "Z"),
+        cmd_wait: float = 0.20,
+        verbose: bool = True,
+        home_switches: bool = False,
+    ):
         """
         home_switches: whether home switches are wired to the controller's HOME
             inputs. This machine has NONE, so HOME is refused: it would drive
@@ -89,12 +95,11 @@ class OESController:
         self.cmd_wait = cmd_wait
         self.verbose = verbose
         self.home_switches = home_switches
-        self.ser: "serial.Serial | None" = None
+        self.ser: serial.Serial | None = None
         self.banner = ""
         self.version = None
 
-    
-    def open(self, tries: int = 3) -> "OESController":
+    def open(self, tries: int = 3) -> OESController:
         """Open the port and run the RESET handshake.
 
         The PL2303 intermittently throws 'device reports readiness to read but
@@ -106,11 +111,16 @@ class OESController:
         for i in range(tries):
             try:
                 self.ser = serial.Serial(
-                    self.port, self.baud, bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
-                    timeout=0.05, rtscts=False, dsrdtr=False,
+                    self.port,
+                    self.baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.05,
+                    rtscts=False,
+                    dsrdtr=False,
                 )
-                self.ser.dtr = False       # DB9 pin 4 is NC on the controller
+                self.ser.dtr = False  # DB9 pin 4 is NC on the controller
                 self.reset()
                 return self
             except (serial.SerialException, OSError) as e:
@@ -133,9 +143,9 @@ class OESController:
 
         if not self.ser:
             raise OESError("port not open")
-        self.ser.rts = True                # SET
-        time.sleep(0.05)                   # >= 10 ms
-        self.ser.rts = False               # CLEAR (release reset; hold clear)
+        self.ser.rts = True  # SET
+        time.sleep(0.05)  # >= 10 ms
+        self.ser.rts = False  # CLEAR (release reset; hold clear)
         # The firmware prints "Version xx.yy" then "Joystick is on" after every
         # reset, including the pulse just sent. Wait up to ~2.5 s for it, but
         # stop ~0.3 s after the last byte so a normal boot does not stall.
@@ -170,8 +180,7 @@ class OESController:
         self.close()
 
     # ------------------------------------------------------------- low level io
-    def raw(self, cmd: str, wait: float | None = None,
-            force: bool = False) -> str:
+    def raw(self, cmd: str, wait: float | None = None, force: bool = False) -> str:
         """Send one CR-terminated command and return the decoded reply.
 
         This is the single guard for everything that reaches the controller:
@@ -191,12 +200,14 @@ class OESController:
         if kind == "destructive" and not force:
             raise OESError(
                 f"{head!r} is refused: it runs or destroys the stored program. "
-                f"Pass force=True only with a deliberate reason.")
+                f"Pass force=True only with a deliberate reason."
+            )
         if head.startswith("HOME") and not self.home_switches:
             raise OESError(
                 f"{head!r} is refused: this machine has no home switches, the "
                 f"axis would run into a hard stop. Construct "
-                f"OESController(home_switches=True) only once they are fitted.")
+                f"OESController(home_switches=True) only once they are fitted."
+            )
         if kind in ("actuator", "output") and self.dry_run:
             self._log(f"[DRY-RUN] would send {cmd.strip()!r}")
             return ""
@@ -241,19 +252,16 @@ class OESController:
         """Execute (or, in dry_run, simulate) a motion command sequence."""
         if self.dry_run:
             self._log(f"[DRY-RUN] {desc}: would send -> {commands}")
-            return {"dry_run": True, "desc": desc, "commands": commands,
-                    "responses": None}
+            return {"dry_run": True, "desc": desc, "commands": commands, "responses": None}
         responses = []
         for c in commands:
             r = self.raw(c)
             responses.append(r)
             self._log(f"  -> {c!r}: {r!r}")
-        return {"dry_run": False, "desc": desc, "commands": commands,
-                "responses": responses}
+        return {"dry_run": False, "desc": desc, "commands": commands, "responses": responses}
 
     # --------------------------------------------------------------- read-only
-    def _read_int(self, cmd: str, prefix: str | None = None,
-                  tries: int = 4) -> int:
+    def _read_int(self, cmd: str, prefix: str | None = None, tries: int = 4) -> int:
         """Read a numeric reply, retrying transient empty/garbled responses.
 
         The controller occasionally returns nothing if polled faster than it can
@@ -267,7 +275,7 @@ class OESController:
                 return self._parse_signed(resp, expect_prefix=prefix)
             except OESError as e:
                 last = e
-                time.sleep(0.05 * (i + 1))     #let the board catch up
+                time.sleep(0.05 * (i + 1))  # let the board catch up
         raise OESError(f"{cmd}: no parseable reply after {tries} tries ({last})")
 
     def report_position(self, axis: str) -> int:
@@ -313,15 +321,15 @@ class OESController:
     def set_velocity(self, axis: str, steps_per_sec: int) -> str:
         a = self._check_axis(axis)
         if not (VEL_MIN <= steps_per_sec <= VEL_MAX):
-            raise OESError(f"velocity {steps_per_sec} out of range "
-                           f"[{VEL_MIN}, {VEL_MAX}] steps/s")
+            raise OESError(f"velocity {steps_per_sec} out of range [{VEL_MIN}, {VEL_MAX}] steps/s")
         return self.raw(f"VEL{a} {int(steps_per_sec)}")
 
     def set_acceleration(self, axis: str, steps_per_sec2: int) -> str:
         a = self._check_axis(axis)
         if not (ACC_MIN <= steps_per_sec2 <= ACC_MAX):
-            raise OESError(f"acceleration {steps_per_sec2} out of range "
-                           f"[{ACC_MIN}, {ACC_MAX}] steps/s^2")
+            raise OESError(
+                f"acceleration {steps_per_sec2} out of range [{ACC_MIN}, {ACC_MAX}] steps/s^2"
+            )
         return self.raw(f"ACC{a} {int(steps_per_sec2)}")
 
     def set_move_operand(self, axis: str, value: int) -> str:
@@ -348,8 +356,16 @@ class OESController:
         a = self._check_axis(axis)
         return self.raw(f"MOFF{a}")
 
-    def _move(self, a: str, mnemonic: str, value: int, vel: int | None,
-              acc: int | None, enable: bool, desc: str) -> dict:
+    def _move(
+        self,
+        a: str,
+        mnemonic: str,
+        value: int,
+        vel: int | None,
+        acc: int | None,
+        enable: bool,
+        desc: str,
+    ) -> dict:
         """Shared body of move_absolute / move_relative: MON, ACC, VEL, POS, then
         the move mnemonic. Returns as soon as the controller acknowledges."""
         if not (POS_MIN <= value <= POS_MAX):
@@ -366,15 +382,27 @@ class OESController:
         seq += [f"POS{a} {int(value)}", f"{mnemonic}{a}"]
         return self._run_sequence(seq, desc)
 
-    def move_absolute(self, axis: str, target: int, vel: int | None = None,
-                      acc: int | None = None, enable: bool = True) -> dict:
+    def move_absolute(
+        self,
+        axis: str,
+        target: int,
+        vel: int | None = None,
+        acc: int | None = None,
+        enable: bool = True,
+    ) -> dict:
         """MOVA: go to `target` steps from the current origin. Does not block;
         call wait_stopped() to wait for the move to end."""
         a = self._check_axis(axis)
         return self._move(a, "MOVA", target, vel, acc, enable, f"absolute move {a} -> {target}")
 
-    def move_relative(self, axis: str, distance: int, vel: int | None = None,
-                      acc: int | None = None, enable: bool = True) -> dict:
+    def move_relative(
+        self,
+        axis: str,
+        distance: int,
+        vel: int | None = None,
+        acc: int | None = None,
+        enable: bool = True,
+    ) -> dict:
         """MOVR: move by `distance` steps (signed). Does not block; call
         wait_stopped() to wait for the move to end."""
         a = self._check_axis(axis)
@@ -387,7 +415,8 @@ class OESController:
         if enable:
             seq.append(f"MON{a}")
         if vel is not None:
-            self._validate_vel(abs(vel)); seq.append(f"VEL{a} {int(vel)}")
+            self._validate_vel(abs(vel))
+            seq.append(f"VEL{a} {int(vel)}")
         seq.append(f"JOG{a}")
         return self._run_sequence(seq, f"jog {a}")
 
@@ -399,7 +428,8 @@ class OESController:
         if not self.home_switches:
             raise OESError(
                 f"HOME{a} refused: no home switches on this machine. Construct "
-                f"OESController(home_switches=True) only once they are fitted.")
+                f"OESController(home_switches=True) only once they are fitted."
+            )
         seq = ([f"MON{a}"] if enable else []) + [f"HOME{a}"]
         return self._run_sequence(seq, f"home {a}")
 
@@ -409,9 +439,15 @@ class OESController:
             return self.raw("STOPALL")
         return self.raw(f"STOP{self._check_axis(axis)}")
 
-    def wait_stopped(self, axis: str, timeout: float = 60.0, poll: float = 0.1,
-                     on_poll: Callable[[], bool] | None = None,
-                     grace: float = 1.0, max_read_failures: int = 5) -> bool:
+    def wait_stopped(
+        self,
+        axis: str,
+        timeout: float = 60.0,
+        poll: float = 0.1,
+        on_poll: Callable[[], bool] | None = None,
+        grace: float = 1.0,
+        max_read_failures: int = 5,
+    ) -> bool:
         """Poll RSTS<axis> bit 0 until the axis is idle. Works with MSGOFF.
         Returns True once the axis is idle, False on timeout or when on_poll
         asked to break out.
@@ -474,13 +510,16 @@ def classify_command(cmd: str) -> str:
     (simulated unless armed), 'safe-stop' (always sent) or 'other' (reads and
     non-motion configuration, always sent). raw() applies this to everything."""
     head = _command_head(cmd)
-    for kind, prefixes in (("safe-stop", _ALWAYS_SAFE_PREFIXES),
-                           ("destructive", _DESTRUCTIVE_PREFIXES),
-                           ("actuator", _ACTUATOR_PREFIXES),
-                           ("output", _OUTPUT_PREFIXES)):
+    for kind, prefixes in (
+        ("safe-stop", _ALWAYS_SAFE_PREFIXES),
+        ("destructive", _DESTRUCTIVE_PREFIXES),
+        ("actuator", _ACTUATOR_PREFIXES),
+        ("output", _OUTPUT_PREFIXES),
+    ):
         if head.startswith(prefixes):
             return kind
     return "other"
+
 
 if __name__ == "__main__":
     # Quick self-test: connect, print version + positions (read-only).
