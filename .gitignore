@@ -3,3 +3,9 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+
+# Kept in the local clone only, never published: the tests, and the Pi-side
+# server and its simulator (the Pi holds its own installed copy).
+test_*.py
+gantry_server.py
+fake_controller.py
