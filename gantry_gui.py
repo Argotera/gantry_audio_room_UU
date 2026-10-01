@@ -2,7 +2,15 @@
 """
 gantry_gui.py -- manual control panel for the OES gantry robot in the robot lab.
 
-  python3 gantry_gui.py [--port /dev/ttyUSB0]
+  python3 gantry_gui.py                                      (asks where to connect)
+  python3 gantry_gui.py --port /dev/ttyUSB0                  default for a linux
+  python3 gantry_gui.py --remote tcp://10.73.133.1:7313      (over Bluetooth to the rpi in the lab)
+
+With neither flag, a chooser lists the USB serial adapters it can see, plus a
+"Bluetooth gantry" entry when this machine is actually on the Pi's Bluetooth
+network. Pass a flag to skip it. The chooser runs once, before connecting:
+there is no way to change target without restarting, on purpose -- see
+TargetChooser.
 
 Position display, typed mm moves, set-origin-here, a big red STOP, and a
 polar (r, phi) move panel for the X/Y plane.
@@ -10,12 +18,24 @@ polar (r, phi) move panel for the X/Y plane.
 NOTES
 * ONE thread owns the serial port (the worker). The Tk thread never touches it.
   Two processes or two threads on the port corrupt the protocol.
-* Connecting RESETS the controller and ZEROES all three counters, so on startup
-  the origin is wherever the machine happens to be standing.
+* Connecting to a LOCAL port RESETS the controller and ZEROES all three
+  counters, so the origin is wherever the machine happens to be standing.
+  Connecting to a REMOTE server does NOT: the server holds the port open, so
+  the counters survive a reconnect. Check the log line at start-up, which says
+  which of the two happened.
+
+REMOTE MODE
+* Starts DISARMED. Untick "dry run" to arm, which asks you to confirm that the
+  workspace is clear and somebody can reach the power cutoff. That question is
+  the point: over Bluetooth you may not be standing next to the machine, and
+  the power switch is the only real emergency stop.
+* If the link drops, the server stops the machine by itself and ends the
+  session. The GUI latches STOP when that happens.
 * The machine has no limit switches, no home switches and no encoders, so
   "position" only ever means "distance from where the machine stood at connect,
   or from where SET ORIGIN was last pressed".
-* The STOP button is NOT an emergency stop. 19200 baud, so about 0.2 s of lag.
+* The STOP button is NOT an emergency stop. STOP is slower over Bluetooth ~0.3-0.5 s
+  rather than 0.2 s, which at VEL 5000 on X or Z is 14-24 mm of travel.
 * HOME is never sent. There are no home switches. oes.py refuses it
   (home_switches=False) and RUN/NEW/SAVE/CONT as well.
 
@@ -36,6 +56,52 @@ POLAR MOVES (the panel on the right)
 * The X leg only runs if the Y counter reached its target. A STOP, a timeout or
   a lost reply between the legs cancels X.
 * Z is never commanded by a polar move.
+
+
+
+
+USAGE:
+
+Connect the raspberry pi to the USB-RS232 adapter connected to the controller's box
+Power up the Pi and the controller. The gantry server on the Pi should start by itself at boot.
+Make sure your computer has a working python environment with packages: pyserial, tkinter
+
+Linux:
+Find and pair bluetooth device named rpi-gen1
+join the Pi's Bluetooth network:
+
+nmcli con up rpi-gen1-bt
+
+then launch gui
+
+python3 gantry_gui.py --remote tcp://10.73.133.1:7313
+or just
+python3 gantry_gui.py and pick up gantry from start-up window
+
+When you're done, close the GUI, then run:
+nmcli con down rpi-gen1-bt
+
+
+
+Windows:
+
+Pair with the Pi:
+Settings → Bluetooth & devices → Add device → Bluetooth → rpi-gen1.
+
+Join the Pi's network:
+   a. Go to Settings → Bluetooth & devices → Devices.
+   b. Under "Other devices", expand rpi-gen1.
+   c. Next to Personal Area Network (PAN), click Join.
+   d. Keep Access Point selected, click Connect, and wait for "Connection successful".
+
+py gantry_gui.py --remote tcp://10.73.133.1:7313
+or just
+py gantry_gui.py and pick up gantry from the start-up window
+
+When you're done, close the GUI, then go back to the same Settings screen and click Disconnect PAN.
+
+
+
 """
 
 from __future__ import annotations
@@ -45,18 +111,20 @@ import contextlib
 import logging
 import math
 import queue
+import socket
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Callable
 
 from oes import MoveResult, OESController, OESError
 
+log = logging.getLogger("gantry_gui")
+
 # --- machine constants (measured; see the machine documentation)
 STEPS_PER_MM = {"X": 105.2632, "Y": 210.5263, "Z": 105.2632}
-# Highest velocity PROVEN clean on each axis. Not the firmware limit (200000),
-# which needs 6000 motor RPM and stalls the motor.
 MAX_VEL = {"X": 5000, "Y": 5000, "Z": 5000}
 DEFAULT_VEL = 4000
 ACC = 40000  # firmware floor; anything lower is silently clamped
@@ -67,6 +135,37 @@ CLOSE_TIMEOUT_S = 6.0  # max wait for STOPALL + MOFF x3 + port close on exit
 MOVE_TIMEOUT_S = 600.0  # give up waiting for a move after this
 IDLE_REFRESH_S = 1.0  # position refresh interval while nothing is queued
 DRAIN_INTERVAL_MS = 50  # how often the Tk thread empties the event queue
+
+# Poll interval while waiting for a move to finish. Every poll is a round trip,
+# which is ~1 ms on a local UART and tens of milliseconds over Bluetooth and
+# several hundred if the link has dropped into sniff mode. Polling a remote link
+# as hard as a local one just floods it.
+MOVE_POLL_S = 0.1
+MOVE_POLL_REMOTE_S = 0.25
+
+# --- the Bluetooth gantry server, as deployed ------------------------------
+# Hard-coded on purpose: there is one Pi, at a fixed address on its own PAN.
+#  These MUST match the Pi's bt-pan-nap address and its gantry_server.py
+# (DEFAULT_TCP_PORT). Change one and you must change the others.
+BT_GANTRY_HOST = "10.73.133.1"
+BT_GANTRY_PORT = 7313
+BT_GANTRY_LABEL = f"Bluetooth gantry ({BT_GANTRY_HOST}:{BT_GANTRY_PORT})"
+
+#: Shown before arming a remote session. Not a formality: over Bluetooth the
+#: operator may be nowhere near the machine, and the power switch is the only
+#: real emergency stop there is.
+REMOTE_ARM_QUESTION = (
+    "You are about to arm the gantry over a REMOTE link.\n\n"
+    "This machine has no limit switches, no home switches and no encoders. "
+    "Nothing detects an overrun, a stall or a crash.\n\n"
+    "STOP is not an emergency stop, and over Bluetooth it is slower: "
+    "0.3-0.5 s, about 14-24 mm at VEL 5000.\n"
+    "THE ONLY EMERGENCY STOP IS THE POWER SWITCH.\n\n"
+    "Confirm BOTH of the following:\n"
+    "  \u2022 the workspace is clear, and\n"
+    "  \u2022 you or somebody else can physically reach the power cutoff.\n\n"
+    "Arm the machine?"
+)
 
 BG, FG, DIM = "#1e1e1e", "#e8e8e8", "#8a8a8a"
 RED, RED_HOT, GREEN, AMBER = "#c0392b", "#e74c3c", "#27ae60", "#d4952a"
@@ -90,6 +189,179 @@ def xy_to_polar(x_mm: float, y_mm: float) -> tuple[float, float]:
     return math.hypot(x_mm, y_mm), math.degrees(math.atan2(x_mm, -y_mm))
 
 
+# ------------------------------------------------------------- connection ----
+@dataclass(frozen=True)
+class Target:
+    """One entry in the startup chooser."""
+
+    label: str  # what the operator sees
+    target: str  # what OESController is given
+    usb: bool = False  # a USB serial adapter, as opposed to a motherboard port
+
+
+def gantry_pan_is_up(host: str = BT_GANTRY_HOST, port: int = BT_GANTRY_PORT) -> bool:
+    """True if this machine is on the gantry Pi's Bluetooth PAN.
+
+    Plain reachability is NOT the test, and getting this wrong would offer
+    the Bluetooth entry on every machine. With a default route present the
+    kernel will happily claim it can reach 10.73.133.1 through the ordinary
+    gateway.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((host, port))
+            local = probe.getsockname()[0]
+    except OSError:
+        return False
+    subnet = host.rsplit(".", 1)[0] + "."  # "10.73.133.1" -> "10.73.133."
+    return local.startswith(subnet)
+
+
+def serial_ports() -> list[object]:
+    """Serial ports pyserial can see. Never raises: a machine with no working
+    pyserial should still be offered the Bluetooth entry."""
+    try:
+        from serial.tools import list_ports
+
+        return list(list_ports.comports())
+    except Exception as e:  # the remote entry still matters
+        log.warning("could not enumerate serial ports: %s", e)
+        return []
+
+
+def list_targets(
+    all_ports: bool = False,
+    ports: list[object] | None = None,
+    pan_up: bool | None = None,
+) -> list[Target]:
+    """Everything the panel could connect to right now.
+
+    Non-USB ports are hidden unless `all_ports`. The gantry is always on a
+    USB-RS232 adapter.
+    """
+    ports = serial_ports() if ports is None else list(ports)
+    pan = gantry_pan_is_up() if pan_up is None else pan_up
+
+    usb: list[Target] = []
+    other: list[Target] = []
+    for port in sorted(ports, key=lambda p: p.device):
+        description = (port.description or "").strip()
+        label = port.device
+        if description and description.lower() != "n/a":
+            label = f"{port.device}  --  {description}"
+        is_usb = port.vid is not None
+        (usb if is_usb else other).append(Target(label, port.device, usb=is_usb))
+
+    targets = usb
+    if pan:
+        targets.append(Target(BT_GANTRY_LABEL, f"tcp://{BT_GANTRY_HOST}:{BT_GANTRY_PORT}"))
+    return targets + (other if all_ports else [])
+
+
+def default_target(targets: list[Target]) -> int:
+    """Which entry to pre-select.
+    Already sketchy machine, at least prefer USB
+    """
+    for index, target in enumerate(targets):
+        if target.usb:
+            return index
+    return 0
+
+
+class TargetChooser:
+    """Startup dialog: pick a serial port, or the Bluetooth gantry.
+    """
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.choice: str | None = None
+        self.targets: list[Target] = []
+
+        root.title("Connect to the gantry")
+        root.configure(bg=BG)
+        frame = tk.Frame(root, bg=BG)
+        frame.pack(padx=16, pady=14, fill="both", expand=True)
+
+        tk.Label(
+            frame,
+            text="Where is the gantry?",
+            bg=BG,
+            fg=FG,
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(anchor="w")
+
+        self.combo = ttk.Combobox(frame, state="readonly", width=52, font=("TkFixedFont", 10))
+        self.combo.pack(pady=(10, 4), fill="x")
+        self.combo.bind("<<ComboboxSelected>>", lambda _e: self._show_target())
+        self.combo.bind("<Return>", lambda _e: self.on_connect())
+
+        self.detail = tk.Label(frame, text="", bg=BG, fg=DIM, anchor="w", font=("TkFixedFont", 9))
+        self.detail.pack(fill="x")
+
+        self.all_ports = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            frame,
+            text="show every serial port (most are motherboard ports with nothing on them)",
+            variable=self.all_ports,
+            command=self.refresh,
+            bg=BG,
+            fg=DIM,
+            selectcolor=ENTRY_BG,
+            activebackground=BG,
+            activeforeground=DIM,
+            highlightthickness=0,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 0))
+
+        buttons = tk.Frame(frame, bg=BG)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Rescan", command=self.refresh).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.on_cancel).pack(side="right")
+        self.connect_btn = ttk.Button(buttons, text="Connect", command=self.on_connect)
+        self.connect_btn.pack(side="right", padx=6)
+
+        root.bind("<Escape>", lambda _e: self.on_cancel())
+        root.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.targets = list_targets(all_ports=self.all_ports.get())
+        self.combo["values"] = [t.label for t in self.targets] or ["(nothing found)"]
+        self.combo.current(default_target(self.targets) if self.targets else 0)
+        self.connect_btn.state(["!disabled"] if self.targets else ["disabled"])
+        self._show_target()
+
+    def _show_target(self) -> None:
+        if not self.targets:
+            hint = "" if self.all_ports.get() else "  Tick the box below to see every port."
+            self.detail.configure(
+                text=f"No USB adapter, and not on the gantry's Bluetooth network.{hint}"
+            )
+            return
+        target = self.targets[self.combo.current()]
+        self.detail.configure(text=f"opens: {target.target}")
+
+    def on_connect(self) -> None:
+        if self.targets:
+            self.choice = self.targets[self.combo.current()].target
+            self.root.quit()
+
+    def on_cancel(self) -> None:
+        self.choice = None
+        self.root.quit()
+
+
+def ask_for_target(root: tk.Tk) -> str | None:
+    """Run the chooser on `root` and return the selected target, or None."""
+    chooser = TargetChooser(root)
+    root.mainloop()
+    for child in root.winfo_children():  # clear the dialog, keep the window
+        child.destroy()
+    for sequence in ("<Escape>",):
+        root.unbind(sequence)
+    return chooser.choice
+
+
 # ----------------------------------------------------------------- worker ----
 class Worker(threading.Thread):
     """Owns the serial port. Everything else talks to it through two queues:
@@ -99,6 +371,9 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.events = events
         self.port = port
+        #: A transport URL rather than a device path means we reach the machine
+        #: through a gantry_server, normally over Bluetooth.
+        self.remote = "://" in port
         self.commands: queue.Queue = queue.Queue()
         self.abort = threading.Event()  # set by STOP, from any thread
         self.quit = threading.Event()
@@ -130,10 +405,26 @@ class Worker(threading.Thread):
         self.emit("log", (msg, tag))
 
     def push_positions(self) -> None:
+        started = time.monotonic()
         try:
             self.emit("pos", {axis: self.ctl.report_position(axis) for axis in AXES})
         except OESError as e:
             self.log(f"position read failed: {e}", "warn")
+            return
+        if self.remote:
+            # Three round trips; report the per-command average so the number
+            # means "what one command costs", which is what STOP lag depends on.
+            self.emit("link", (time.monotonic() - started) / len(AXES))
+
+    def on_server_event(self, name: str, payload: str) -> None:
+        """Unsolicited news from the server. Called on whichever thread is
+        reading the link, so it only ever posts to the event queue.
+        The important one is the watchdog.
+        """
+        self.log(f"SERVER {name}: {payload}", "err")
+        if name in ("watchdog", "goodbye"):
+            self.abort.set()
+            self.emit("linkdown", f"{name}: {payload}")
 
     # -- public API (called from the Tk thread) -----------------------------
     def submit(self, kind: str, **kwargs: object) -> None:
@@ -152,14 +443,28 @@ class Worker(threading.Thread):
     def run(self) -> None:
         logging.getLogger("oes").addHandler(_LogToGui(self))
         try:
-            self.controller = OESController(port=self.port, verbose=False).open()
+            options: dict[str, object] = {}
+            if self.remote:
+                options = {"client_name": "gantry_gui", "on_event": self.on_server_event}
+            self.controller = OESController(
+                port=self.port, verbose=False, transport_options=options
+            ).open()
             self.ctl.joystick(False)
-            # The driver starts in dry run. This panel is live from the start.
-            self.ctl.arm(confirm=True)
-            self.emit("status", ("ARMED   ·  motion is LIVE", GREEN))
-            self.log(f"connected on {self.ctl.port}, firmware {self.ctl.version}")
-            self.log("ARMED -- motion commands are transmitted for real", "ok")
-            self.log("counters zeroed by the connect reset -- origin is HERE")
+            self.log(f"connected to {self.ctl.target}, firmware {self.ctl.version}")
+            if self.ctl.transport.resets_on_open:
+                self.log("counters zeroed by the connect reset -- origin is HERE")
+            else:
+                self.log("server held the port open: counters were NOT zeroed", "ok")
+                self.log("position is whatever the server has been tracking, not 'here'", "warn")
+            if self.remote:
+                # Remote sessions start disarmed.
+                self.emit("status", ("DRY RUN  ·  NOT ARMED -- untick 'dry run' to arm", AMBER))
+                self.log("remote session: DISARMED until you untick 'dry run'", "warn")
+            else:
+                # The driver starts in dry run. The local panel is live from the start.
+                self.ctl.arm(confirm=True)
+                self.emit("status", ("ARMED   ·  motion is LIVE", GREEN))
+                self.log("ARMED -- motion commands are transmitted for real", "ok")
             self.push_positions()
         except Exception as e:
             self.emit("status", (f"NOT CONNECTED: {e}", RED_HOT))
@@ -193,6 +498,9 @@ class Worker(threading.Thread):
         for axis in AXES:
             self.ctl.motor_off(axis)
         self.ctl.close()
+
+    def poll_interval(self) -> float:
+        return MOVE_POLL_REMOTE_S if self.remote else MOVE_POLL_S
 
     # -- commands -----------------------------------------------------------
     def _do_stop(self) -> None:
@@ -314,7 +622,9 @@ class Worker(threading.Thread):
             return False
 
         try:
-            done = self.ctl.wait_stopped(axis, timeout=timeout, on_poll=between_polls)
+            done = self.ctl.wait_stopped(
+                axis, timeout=timeout, poll=self.poll_interval(), on_poll=between_polls
+            )
         except OESError as e:
             self.log(f"{axis}: lost contact during the move ({e}) -- STOPALL", "err")
             self.ctl.stop()
@@ -342,10 +652,13 @@ class App:
         self.root = root
         self.events: queue.Queue = queue.Queue()
         self.worker = Worker(self.events, port)
+        self.remote = self.worker.remote
         self.steps = {axis: 0 for axis in AXES}  # last known counters
         self.busy = False
+        self.status_base = "connecting…"
+        self.link_text = ""
 
-        root.title("OES Gantry — manual + polar control")
+        root.title("OES Gantry — remote" if self.remote else "OES Gantry — manual + polar control")
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Escape>", lambda _event: self.on_kill())
@@ -444,7 +757,8 @@ class App:
             fg=DIM,
         ).pack(side="left")
 
-        self.simulate = tk.BooleanVar(value=False)
+        # Remote sessions start DISARMED.
+        self.simulate = tk.BooleanVar(value=self.remote)
         tk.Checkbutton(
             bar,
             text="dry run (simulate, do not move)",
@@ -503,8 +817,14 @@ class App:
         root.grid_rowconfigure(10, weight=1)
         root.grid_columnconfigure(1, weight=1)
 
-    @staticmethod
-    def stop_note() -> str:
+    def stop_note(self) -> str:
+        if self.remote:
+            return (
+                "NOT an emergency stop!!!  (Bluetooth link + 19200 baud serial)\n"
+                "~0.3-0.5 s lag (~14-24 mm at VEL 5000 on X/Z).\n"
+                "For a real emergency, CUT THE POWER — make sure somebody can reach it.\n"
+                "[Esc] also triggers STOP."
+            )
         return (
             "NOT an emergency stop!!!  (19200 baud serial link)\n"
             "~0.2 s lag (~10 mm at VEL 5000).\n"
@@ -680,7 +1000,19 @@ class App:
         self.worker.submit("polar", x_steps=x_steps, y_steps=y_steps, vel_x=vel_x, vel_y=vel_y)
 
     def on_toggle_dry(self) -> None:
-        self.worker.submit("arm", live=not self.simulate.get())
+        going_live = not self.simulate.get()
+        if going_live and self.remote and not self._acknowledge_remote_arming():
+            self.simulate.set(True)  # put the tick back; nothing was armed
+            self._log("arming cancelled — still in dry run", "warn")
+            return
+        self.worker.submit("arm", live=going_live)
+
+    def _acknowledge_remote_arming(self) -> bool:
+        """The per-session acknowledgement required before a remote link may
+        move the machine. Deliberate friction."""
+        return bool(
+            messagebox.askyesno("Arm the gantry remotely?", REMOTE_ARM_QUESTION, icon="warning")
+        )
 
     def on_zero_all(self) -> None:
         self.worker.submit("zero", axes=list(AXES))
@@ -718,6 +1050,29 @@ class App:
         self.root.destroy()
 
     # -- plumbing -----------------------------------------------------------
+    def _render_status(self) -> None:
+        text = self.status_base
+        if self.link_text:
+            text = f"{text}   ·   {self.link_text}"
+        self.status.configure(text=text, fg=getattr(self, "status_colour", AMBER))
+
+    def _on_link_down(self, message: str) -> None:
+        """The server stopped the machine and ended the session on its own.
+
+        Latch STOP so nothing can be sent into a session that no longer exists,
+        and make it loud: the machine moved, or was moving, without us.
+        """
+        self.kill_btn.configure(text="■  LINK LOST  ■", bg=STOPPED_RED)
+        self.reset_btn.configure(state="normal")
+        self.simulate.set(True)
+        self.status_base = "LINK LOST — the server stopped the machine"
+        self.status_colour = RED_HOT
+        self.link_text = ""
+        self._render_status()
+        self._log(f"LINK LOST: {message}", "err")
+        self._log("the server sent STOPALL and ended the session", "err")
+        self._log("reconnect by restarting this panel; it will start disarmed", "warn")
+
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         for axis in AXES:
@@ -742,7 +1097,13 @@ class App:
                 elif kind == "log":
                     self._log(*payload)
                 elif kind == "status":
-                    self.status.configure(text=payload[0], fg=payload[1])
+                    self.status_base, self.status_colour = payload
+                    self._render_status()
+                elif kind == "link":
+                    self.link_text = f"link {payload * 1000:.0f} ms"
+                    self._render_status()
+                elif kind == "linkdown":
+                    self._on_link_down(payload)
                 elif kind == "busy":
                     self._set_busy(payload)
         except queue.Empty:
@@ -832,10 +1193,34 @@ class App:
         c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=GREEN, outline="")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Manual control panel for the OES gantry.")
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="serial port (default /dev/ttyUSB0)")
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Manual control panel for the OES gantry.",
+        epilog="Use --remote to drive the machine through a gantry_server, "
+        "normally over a Bluetooth PAN. A remote panel starts disarmed.",
+    )
+    where = parser.add_mutually_exclusive_group()
+    where.add_argument(
+        "--port",
+        help="serial port, e.g. /dev/ttyUSB0. Omit both this and --remote to be asked.",
+    )
+    where.add_argument(
+        "--remote",
+        metavar="URL",
+        help="reach the machine through a server, e.g. tcp://10.73.133.1:7313",
+    )
+    args = parser.parse_args(argv)
+
     window = tk.Tk()
-    App(window, args.port)
+    target = args.remote or args.port
+    if target is None:
+        target = ask_for_target(window)
+        if target is None:  # cancelled
+            window.destroy()
+            return
+    App(window, target)
     window.mainloop()
+
+
+if __name__ == "__main__":
+    main()
