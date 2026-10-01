@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import socket
+import threading
 import time
 
 try:
@@ -88,7 +90,46 @@ class GantryError(Exception):
     """Could not talk to the controller."""
 
 
-class Gantry:
+class _Reads:
+    """The read vocabulary, shared by the local and remote transports below.
+
+    Both need exactly these four, and both get them from raw(), so they live
+    here once rather than being written twice in the same file.
+    """
+
+    def raw(self, cmd: str, wait: float | None = None) -> str:  # pragma: no cover
+        raise NotImplementedError
+
+    def _read_int(self, cmd: str, prefix: str | None = None, tries: int = 4) -> int:
+        """Numeric read with retry. A transient empty reply is normal and must
+        never abort a move-completion poll."""
+        last_error: Exception | None = None
+        for attempt in range(1, tries + 1):
+            text = self.raw(cmd).strip()
+            if prefix and text[:1].upper() == prefix.upper():
+                text = text[1:]
+            words = text.split()
+            first = words[0] if words else text
+            try:
+                return int(first.replace("+", ""))
+            except ValueError as e:
+                last_error = e
+                time.sleep(POLL_S * attempt)
+        raise GantryError(f"{cmd}: no parseable reply after {tries} tries ({last_error})")
+
+    def position(self, axis: str) -> int:
+        """R<axis> -> commanded step counter (NOT where the axis actually is)."""
+        return self._read_int(f"R{axis}", prefix=axis)
+
+    def positions(self) -> dict[str, int]:
+        return {axis: self.position(axis) for axis in AXES}
+
+    def is_moving(self, axis: str) -> bool:
+        """RSTS<axis> bit 0. Works with MSGOFF. Do not poll faster than ~20 Hz."""
+        return bool(self._read_int(f"RSTS{axis}") & 0x1)
+
+
+class Gantry(_Reads):
     """Minimal RS-232 client for the OES controller.
 
     A deliberate copy of the transport layer in oes.py, so that this file stays
@@ -191,36 +232,187 @@ class Gantry:
                 break
         return buf.decode("latin-1", "replace").strip()
 
-    def _read_int(self, cmd: str, prefix: str | None = None, tries: int = 4) -> int:
-        """Numeric read with retry. A transient empty reply is normal and must
-        never abort a move-completion poll."""
-        last_error: Exception | None = None
-        for attempt in range(1, tries + 1):
-            text = self.raw(cmd).strip()
-            if prefix and text[:1].upper() == prefix.upper():
-                text = text[1:]
-            words = text.split()
-            first = words[0] if words else text
-            try:
-                return int(first.replace("+", ""))
-            except ValueError as e:
-                last_error = e
-                time.sleep(POLL_S * attempt)
-        raise GantryError(f"{cmd}: no parseable reply after {tries} tries ({last_error})")
-
-    def position(self, axis: str) -> int:
-        """R<axis> -> commanded step counter (NOT where the axis actually is)."""
-        return self._read_int(f"R{axis}", prefix=axis)
-
-    def positions(self) -> dict[str, int]:
-        return {axis: self.position(axis) for axis in AXES}
-
-    def is_moving(self, axis: str) -> bool:
-        """RSTS<axis> bit 0. Works with MSGOFF. Do not poll faster than ~20 Hz."""
-        return bool(self._read_int(f"RSTS{axis}") & 0x1)
-
     def stop_all(self) -> str:
         return self.raw("STOPALL")
+
+
+# --------------------------------------------------------------------------
+# Remote operation: the same machine reached through a gantry_server that owns
+# the serial port, normally over a Bluetooth PAN.
+#
+# This client is deliberately a SECOND implementation rather than an import.
+# move.py's whole point is that one file can be copied anywhere. The cost is
+# that the two constants below are duplicated from gantry_link.py -- but the
+# server refuses a protocol-version mismatch outright, so getting it wrong
+# fails loudly on connect rather than silently doing the wrong thing.
+# --------------------------------------------------------------------------
+
+PROTOCOL_VERSION = 1  # keep in step with gantry_link.PROTOCOL_VERSION
+ARM_ACKNOWLEDGEMENT = "workspace clear; power cutoff reachable"
+PING_INTERVAL_S = 1.0  # keeps the server's watchdog happy and the link out of sniff
+LATENCY_BUDGET_S = 2.0  # added to each command's wait; a sniffing link is slow to wake
+
+
+def _escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+
+
+def _unescape(text: str) -> str:
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in "\\rn":
+                out.append({"\\": "\\", "r": "\r", "n": "\n"}[nxt])
+                i += 2
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+class RemoteGantry(_Reads):
+    """Same surface as Gantry, but the serial port lives on another machine.
+
+    ⚠️ Opening does NOT reset the controller -- the server holds the port open
+    so that step counters survive a dropped link. The counter you read is
+    whatever the server has been tracking, not "zero, here".
+
+    ⚠️ The server stops the machine if the link goes quiet, so this keeps a
+    heartbeat running for as long as it is connected.
+    """
+
+    def __init__(self, url: str, cmd_wait: float = 0.20, connect_timeout: float = 10.0) -> None:
+        self.url = url
+        self.cmd_wait = cmd_wait
+        self.connect_timeout = connect_timeout
+        self.sock: socket.socket | None = None
+        self.version: str | None = None
+        self.info: dict[str, str] = {}
+        self._buf = bytearray()
+        self._next_id = 0
+        self._lock = threading.RLock()
+        self._last_activity = 0.0
+        self._closing = threading.Event()
+        self._pinger: threading.Thread | None = None
+
+    # -- lifecycle ----------------------------------------------------------
+    def open(self) -> RemoteGantry:
+        scheme, _, rest = self.url.partition("://")
+        if scheme.lower() != "tcp":
+            raise GantryError(f"expected tcp://host:port, got {self.url!r}")
+        host, _, port = rest.rpartition(":")
+        if not host or not port.isdigit():
+            raise GantryError(f"expected tcp://host:port, got {self.url!r}")
+        try:
+            self.sock = socket.create_connection((host, int(port)), timeout=self.connect_timeout)
+        except OSError as e:
+            raise GantryError(f"cannot reach {self.url}: {e}") from e
+        self._last_activity = time.monotonic()
+        payload = self._request("HELLO", str(PROTOCOL_VERSION), "move.py")
+        self.info = dict(item.split("=", 1) for item in payload.split(" ") if "=" in item)
+        self.version = self.info.get("firmware")
+        self._closing.clear()
+        self._pinger = threading.Thread(target=self._ping_loop, daemon=True)
+        self._pinger.start()
+        return self
+
+    def close(self) -> None:
+        self._closing.set()
+        if self._pinger is not None:
+            self._pinger.join(timeout=2.0)
+            self._pinger = None
+        if self.sock is not None:
+            with contextlib.suppress(OSError):
+                self.sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                self.sock.close()
+            self.sock = None
+
+    def __enter__(self) -> RemoteGantry:
+        return self.open()
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- the wire -----------------------------------------------------------
+    def _read_line(self) -> str:
+        assert self.sock is not None
+        while True:
+            index = self._buf.find(b"\n")
+            if index >= 0:
+                line = bytes(self._buf[:index])
+                del self._buf[: index + 1]
+                return line.decode("latin-1", "replace").rstrip("\r")
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                # An unterminated remainder is dropped on purpose: a truncated
+                # line can still parse as a valid but DIFFERENT message.
+                raise GantryError(
+                    f"{self.url} closed the link. If the server's watchdog fired it has "
+                    f"sent STOPALL and ended the session."
+                )
+            self._buf.extend(chunk)
+
+    def _request(self, verb: str, *args: str, wait: float = 0.0) -> str:
+        if self.sock is None:
+            raise GantryError(f"not connected to {self.url}")
+        timeout = wait + LATENCY_BUDGET_S
+        with self._lock:
+            self._next_id += 1
+            request_id = self._next_id
+            # Only the trailing field is escaped, which keeps a command with a
+            # space in it ("VELX 5000") readable in the server's log.
+            fields = [verb, str(request_id)]
+            if args:
+                fields += list(args[:-1]) + [_escape(args[-1])]
+            line = " ".join(fields)
+            try:
+                self.sock.settimeout(timeout)
+                self.sock.sendall((line + "\n").encode("latin-1"))
+            except OSError as e:
+                raise GantryError(f"link to {self.url} failed: {e}") from e
+            while True:
+                try:
+                    reply = self._read_line()
+                except OSError as e:
+                    raise GantryError(f"link to {self.url} failed: {e}") from e
+                self._last_activity = time.monotonic()
+                pieces = reply.split(" ")
+                if pieces[0].upper() == "EVT":
+                    print(f"  ** server event: {' '.join(pieces[1:])}")
+                    continue
+                if pieces[0].upper() != "REP" or len(pieces) < 3:
+                    raise GantryError(f"unintelligible reply from {self.url}: {reply!r}")
+                if pieces[1] != str(request_id):
+                    continue  # a late answer to something we already gave up on
+                if pieces[2].upper() == "OK":
+                    return _unescape(" ".join(pieces[3:]))
+                reason = _unescape(" ".join(pieces[4:]))
+                raise GantryError(f"{verb} refused [{pieces[3]}]: {reason}")
+
+    def _ping_loop(self) -> None:
+        while not self._closing.wait(PING_INTERVAL_S / 2.0):
+            if time.monotonic() - self._last_activity < PING_INTERVAL_S:
+                continue
+            try:
+                self._request("PING")
+            except (GantryError, OSError):
+                return
+
+    # -- the same vocabulary as Gantry --------------------------------------
+    def raw(self, cmd: str, wait: float | None = None) -> str:
+        wait = self.cmd_wait if wait is None else wait
+        return self._request("CMD", str(int(wait * 1000)), cmd, wait=wait)
+
+    def arm(self) -> None:
+        """Unlock motion on the server for this session."""
+        self._request("ARM", ARM_ACKNOWLEDGEMENT)
+
+    def stop_all(self) -> str:
+        """Priority STOP: the server runs it ahead of anything else queued."""
+        self._request("STOP")
+        return ""
 
 
 def micron_per_step(axis: str) -> float:
@@ -275,9 +467,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force", action="store_true", help="allow --vel above the proven-clean ceiling"
     )
-    parser.add_argument(
-        "--port", default=DEFAULT_PORT, help=f"serial port (default {DEFAULT_PORT})"
+    where = parser.add_mutually_exclusive_group()
+    where.add_argument(
+        "--remote",
+        metavar="URL",
+        help="drive the machine through a gantry_server instead of a local port, "
+        "e.g. tcp://10.73.133.1:7313 over a Bluetooth PAN. Requires --acknowledge "
+        "for anything that moves.",
     )
+    parser.add_argument(
+        "--acknowledge",
+        action="store_true",
+        help="REMOTE MOTION ONLY. Asserts that the workspace is clear and that you or "
+        "somebody else can physically reach the power cutoff. Over a remote link you "
+        "may not be near the machine, and the power switch is the only real emergency "
+        "stop. There is no way to move remotely without this.",
+    )
+    where.add_argument("--port", default=DEFAULT_PORT, help=f"serial port (default {DEFAULT_PORT})")
     args = parser.parse_args(argv)
 
     if not VEL_MIN <= args.vel <= VEL_MAX:
@@ -365,9 +571,26 @@ def run_move(gantry: Gantry, args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     axis = args.axis
-    with Gantry(args.port) as gantry:
-        print(f"connected: firmware {gantry.version}")
+    if args.remote and args.step_count and not args.acknowledge:
+        raise SystemExit(
+            "refusing to move over a remote link without --acknowledge.\n"
+            "It asserts that the workspace is clear and that somebody can reach the\n"
+            "power cutoff. This machine has no limit switches and no encoders, and\n"
+            "over Bluetooth STOP lags 0.3-0.5 s (14-24 mm at VEL 5000 on X/Z).\n"
+            "The power switch is the only real emergency stop."
+        )
+    gantry = RemoteGantry(args.remote) if args.remote else Gantry(args.port)
+    with gantry:
+        if args.remote:
+            print(f"connected to {args.remote}: firmware {gantry.version}")
+            print("  the server holds the port: counters were NOT zeroed by connecting")
+            print("  position below is what the server has been tracking, not 'zero, here'")
+        else:
+            print(f"connected: firmware {gantry.version}")
         print(f"JOFF -> {gantry.raw('JOFF')!r}")  # the board boots with the joystick enabled
+        if args.remote and args.step_count:
+            gantry.arm()
+            print("  server session ARMED (workspace clear; power cutoff reachable)")
 
         if args.home_counter:
             gantry.raw(f"SPOS{axis} 0")
