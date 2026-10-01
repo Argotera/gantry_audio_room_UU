@@ -140,7 +140,7 @@ class OESController:
         """Open the port and run the RESET handshake.
 
         The PL2303 intermittently throws 'device reports readiness to read but
-        returned no data' on open -- a transient, not a real disconnect (the
+        returned no data' on open (a transient, not a real disconnect, the
         adapter stays enumerated at the same bus address). Retry rather than
         failing the whole run.
         """
@@ -174,9 +174,8 @@ class OESController:
         """Documented RESET/init pulse on RTS (pin 7): SET >= 10 ms, then CLEAR.
 
         NOTE: open() calls this, so every OESController() invocation resets the
-        board and ZEROES all step counters. (A bare port close does NOT reset --
-        verified -- but our open deliberately does.) On this open-loop machine
-        the counters therefore read 0 at the start of every script run,
+        board and ZEROES all step counters. (A bare port close does NOT reset, this one does.)
+        On this open-loop machine the counters therefore read 0 at the start of every script run,
         regardless of where the axes physically are. Never infer physical
         position from a counter across script invocations.
         """
@@ -496,7 +495,7 @@ class OESController:
         that finishes before the first poll and a controller that has not
         started the move yet.
 
-        on_poll is called between polls; return True to break out (the caller
+        on_poll is called between polls. Teturn True to break out (the caller
         decides whether to STOP). A GUI uses it to check its abort flag and
         refresh the position display.
 

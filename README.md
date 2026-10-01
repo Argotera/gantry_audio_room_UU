@@ -1,17 +1,17 @@
-# Gantry robot, audio lab (room 73133)
+# Gantry robot (room 73133)
 
-Python tools for the DIY three-axis belt gantry in the audio lab.
+Python tools for the DIY three-axis belt gantry in the robot lab.
 
 | File | What it is |
 |---|---|
 | `oes.py` | Driver: serial protocol, reset handshake, guarded motion API. |
-| `gantry_gui.py` | Manual control GUI. |
-| `move.py` | Command line mover for use in scripts. Self contained, needs nothing else from this repo. |
+| `gantry_gui.py` | Manual control GUI, including polar (r, φ) moves in the X/Y plane. |
+| `move.py` | Cli for use in scripts. Self contained, needs nothing else from this repo. |
 
 The full machine description, wiring, calibration along with a complete list of
 details and gotchas are in a separate PDF. Ask the lab for it.
 
-## Read this before anything moves
+## The Gantry is a DIY machine. Read this and the accompanying pdf before first use.
 
 **The machine has no idea where it is.** There are no limit switches, no home
 switch and no encoders. The step counter records what was commanded, not its actual position.
@@ -30,19 +30,38 @@ A stall, a slipped belt or a crash produces exactly the same output as a perfect
 - **STOP is not an emergency stop.**  ~0.2 s lag. **The emergency stop is the power cord.**
 - The controller boots with its joystick enabled. Every tool here sends `JOFF` first.
 
+
 ## Setup
 
-Python 3.7+, pyserial, tkinter for the GUI. The user must be in the
-`dialout` group so that no `sudo` is needed.
+You need Python 3.7 or newer, `pyserial`, and `tkinter` for the GUI.
+Examples for uv and conda below. Run the commands from the repository folder.
+
+**With uv**
 
 ```bash
-pip install -r requirements.txt
+uv venv                     # creates .venv/ in the current folder
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+uv pip install -r requirements.txt
 ```
 
-The unit tests run against a fake serial port, so no hardware is needed:
+The Python that uv downloads already includes tkinter.
+
+**With conda**
 
 ```bash
-python3 -m unittest -v
+conda create -n gantry -c conda-forge python pyserial
+conda activate gantry
+```
+
+Conda's Python already includes tkinter.
+
+
+
+**Serial port access (Linux).** Your user must be in the `dialout` group, so
+that no `sudo` is needed. Add yourself once, then log out and back in:
+
+```bash
+sudo usermod -aG dialout $USER
 ```
 
 ## The GUI
@@ -56,13 +75,20 @@ Opens the port, which resets the controller and zeroes the counters, sends
 for confirmation. `Esc` is STOP. STOP latches: press *reset STOP latch* before
 the next move.
 
+The panel on the left one can either input an absolute position(), or amount of displacement
+The panel on the right moves X and Y to a polar target measured from the
+origin: `r` in mm and `φ` in degrees, with φ = 0 along −Y and +φ toward +X
+(−90° to +90°). It moves Y first and then X, an L-shaped path rather than a
+straight line, and draws that path before you press GO. X only runs if Y
+arrived on target. Z is never moved.
+
 ## The command line mover
 
 ```bash
 ./move.py --axis X --mm -250         # -250 mm on X and stay there
 ./move.py --axis Z --home-counter    # SPOSZ 0: redefine here as zero, no motion
 ./move.py --axis Y                   # only report the counters
-./move.py --help                     # help and remaining flags
+./move.py --help                     # help and remaining flags, read this before using move.py
 ```
 
 Motion is always live. `Ctrl+C` sends `STOPALL`.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-move.py -- self-contained one-axis mover for the gantry robot in the audio lab.
+move.py -- self-contained one-axis mover for the gantry robot in the robot lab.
 
 Needs only Python 3.7+ and pyserial. On purpose it imports nothing else from the
 repository, so this one file can be copied to any computer with the USB adapter

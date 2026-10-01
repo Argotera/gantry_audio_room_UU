@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-gantry_gui.py -- manual control panel for the OES gantry robot in the audio lab.
+gantry_gui.py -- manual control panel for the OES gantry robot in the robot lab.
 
   python3 gantry_gui.py [--port /dev/ttyUSB0]
 
-Position display, typed mm moves, set-origin-here, and a big red STOP.
+Position display, typed mm moves, set-origin-here, a big red STOP, and a
+polar (r, phi) move panel for the X/Y plane.
 
 NOTES
 * ONE thread owns the serial port (the worker). The Tk thread never touches it.
@@ -17,6 +18,24 @@ NOTES
 * The STOP button is NOT an emergency stop. 19200 baud, so about 0.2 s of lag.
 * HOME is never sent. There are no home switches. oes.py refuses it
   (home_switches=False) and RUN/NEW/SAVE/CONT as well.
+
+POLAR MOVES (the panel on the right)
+  r   distance from the origin, mm (>= 0)
+  phi angle in degrees, -90 .. +90
+
+  x = r * sin(phi)        phi = 0   -> straight along -Y
+  y = -r * cos(phi)       phi > 0   -> toward +X (north)
+                          phi < 0   -> toward -X
+  so tan(phi) = x / |y|, and every target lies on the -Y side (y <= 0).
+
+* The polar target is ABSOLUTE from the origin (SET ORIGIN HERE or the connect
+  reset), not relative to where the machine stands.
+* Path: Y first, then X -- two single-axis MOVA moves, an L-shaped path, NOT
+  a straight line. The top-view plot draws it before you press GO.
+  Future option: start X and Y together (needs two-axis polling, untested).
+* The X leg only runs if the Y counter reached its target. A STOP, a timeout or
+  a lost reply between the legs cancels X.
+* Z is never commanded by a polar move.
 """
 
 from __future__ import annotations
@@ -24,6 +43,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
+import math
 import queue
 import threading
 import time
@@ -31,7 +51,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from oes import OESController, OESError
+from oes import MoveResult, OESController, OESError
 
 # --- machine constants (measured; see the machine documentation)
 STEPS_PER_MM = {"X": 105.2632, "Y": 210.5263, "Z": 105.2632}
@@ -51,6 +71,23 @@ DRAIN_INTERVAL_MS = 50  # how often the Tk thread empties the event queue
 BG, FG, DIM = "#1e1e1e", "#e8e8e8", "#8a8a8a"
 RED, RED_HOT, GREEN, AMBER = "#c0392b", "#e74c3c", "#27ae60", "#d4952a"
 ENTRY_BG, LOG_BG, STOPPED_RED = "#2b2b2b", "#141414", "#7a1c12"
+
+# --- polar panel
+PHI_MIN, PHI_MAX = -90.0, 90.0
+PLOT_W, PLOT_H = 380, 320
+PLOT_MIN_EXTENT_MM = 100.0  # smallest half-width the plot zooms in to
+
+
+# ------------------------------------------------------------------ polar ----
+def polar_to_xy(r_mm: float, phi_deg: float) -> tuple[float, float]:
+    """(r, phi) -> (x, y) in mm. phi = 0 on -Y, positive toward +X."""
+    phi = math.radians(phi_deg)
+    return r_mm * math.sin(phi), -r_mm * math.cos(phi)
+
+
+def xy_to_polar(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """(x, y) -> (r, phi_deg). Inverse of polar_to_xy; |phi| > 90 means y > 0."""
+    return math.hypot(x_mm, y_mm), math.degrees(math.atan2(x_mm, -y_mm))
 
 
 # ----------------------------------------------------------------- worker ----
@@ -76,6 +113,7 @@ class Worker(threading.Thread):
             "arm": self._do_arm,
             "zero": self._do_zero,
             "move": self._do_move,
+            "polar": self._do_polar,
         }
 
     # -- helpers ------------------------------------------------------------
@@ -201,22 +239,66 @@ class Worker(threading.Thread):
         mm = steps / STEPS_PER_MM[axis]
         self.emit("busy", True)
         try:
-            acc = None if axis in self.acc_sent else ACC
-            vel_to_send = None if self.vel_sent.get(axis) == vel else vel
+            result = self._send_move(axis, steps, vel, absolute)
             if absolute:
-                result = self.ctl.move_absolute(axis, steps, vel=vel_to_send, acc=acc)
                 self.log(f"{axis} -> {mm:+.3f} mm  (abs, VEL {vel})")
             else:
-                result = self.ctl.move_relative(axis, steps, vel=vel_to_send, acc=acc)
                 self.log(f"{axis} {mm:+.3f} mm  (rel, VEL {vel})")
             if result.dry_run:
                 self.log("DRY RUN -- nothing was sent; the machine will not move", "warn")
                 return
-            self.acc_sent.add(axis)
-            self.vel_sent[axis] = vel
             self._wait_move(axis)
         finally:
             self.emit("busy", False)
+
+    def _do_polar(self, x_steps: int, y_steps: int, vel_x: int, vel_y: int) -> None:
+        """MOVA Y, wait, check the counter, then MOVA X, wait. X only if Y landed."""
+        if self.abort.is_set():
+            self.log("polar move refused: STOP is latched -- press RESET STOP", "warn")
+            self.emit("busy", False)
+            return
+        self.emit("busy", True)
+        try:
+            for axis, target, vel in (("Y", y_steps, vel_y), ("X", x_steps, vel_x)):
+                if self.abort.is_set():
+                    self.log(f"polar move: STOP pressed, {axis} leg not started", "err")
+                    return
+                if not self._polar_leg(axis, target, vel):
+                    if axis == "Y":
+                        self.log("polar move: X leg cancelled", "err")
+                    return
+            self.log("polar move complete", "ok")
+        finally:
+            self.emit("busy", False)
+
+    def _polar_leg(self, axis: str, target: int, vel: int) -> bool:
+        """One absolute single-axis move. True if the counter ended on target
+        (or in dry run, where nothing moves)."""
+        result = self._send_move(axis, target, vel, absolute=True)
+        self.log(f"{axis} -> {target / STEPS_PER_MM[axis]:+.3f} mm  (abs, VEL {vel})")
+        if result.dry_run:
+            self.log("DRY RUN -- nothing was sent; the machine will not move", "warn")
+            return True
+        self._wait_move(axis)
+        if self.abort.is_set():
+            return False
+        now = self.ctl.report_position(axis)
+        if now != target:
+            self.log(f"{axis} counter reads {now}, expected {target} -- not on target", "err")
+            return False
+        return True
+
+    def _send_move(self, axis: str, steps: int, vel: int, absolute: bool) -> MoveResult:
+        """MOVA or MOVR, with ACC sent once per axis and VEL only when it changed.
+        The cache is updated only when the move was transmitted, not in dry run."""
+        acc = None if axis in self.acc_sent else ACC
+        vel_to_send = None if self.vel_sent.get(axis) == vel else vel
+        move = self.ctl.move_absolute if absolute else self.ctl.move_relative
+        result = move(axis, steps, vel=vel_to_send, acc=acc)
+        if not result.dry_run:
+            self.acc_sent.add(axis)
+            self.vel_sent[axis] = vel
+        return result
 
     def _wait_move(self, axis: str, timeout: float = MOVE_TIMEOUT_S) -> None:
         """Block until the move ends, through the driver's wait loop. Between
@@ -263,12 +345,14 @@ class App:
         self.steps = {axis: 0 for axis in AXES}  # last known counters
         self.busy = False
 
-        root.title("OES Gantry — manual control")
+        root.title("OES Gantry — manual + polar control")
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Escape>", lambda _event: self.on_kill())
 
         self._build()
+        self._build_polar()
+        self._redraw_polar()
         self.worker.start()
         self.root.after(DRAIN_INTERVAL_MS, self._drain)
 
@@ -427,6 +511,68 @@ class App:
             "For a real emergency, CUT THE POWER.   [Esc] also triggers STOP."
         )
 
+    def _polar_entry(self, parent: tk.Widget, width: int = 9) -> tk.Entry:
+        return tk.Entry(
+            parent,
+            width=width,
+            justify="right",
+            bg=ENTRY_BG,
+            fg=FG,
+            insertbackground=FG,
+            font=("TkFixedFont", 13),
+        )
+
+    def _build_polar(self) -> None:
+        panel = tk.Frame(self.root, bg=BG, highlightthickness=1, highlightbackground=DIM)
+        panel.grid(row=0, column=6, rowspan=11, sticky="nsew", padx=8, pady=8)
+
+        tk.Label(
+            panel,
+            text="POLAR MOVE  (from origin, X/Y only)",
+            bg=BG,
+            fg=FG,
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 2))
+        tk.Label(
+            panel,
+            text="φ = 0 along −Y,  +φ toward +X (north),  −90 … +90°",
+            bg=BG,
+            fg=DIM,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=6)
+
+        tk.Label(panel, text="r  [mm]", bg=BG, fg=DIM).grid(row=2, column=0, sticky="e", padx=6)
+        self.r_entry = self._polar_entry(panel)
+        self.r_entry.grid(row=2, column=1, sticky="w", pady=4)
+        tk.Label(panel, text="φ  [deg]", bg=BG, fg=DIM).grid(row=2, column=2, sticky="e", padx=6)
+        self.phi_entry = self._polar_entry(panel)
+        self.phi_entry.grid(row=2, column=3, sticky="w", pady=4)
+        for entry in (self.r_entry, self.phi_entry):
+            entry.bind("<KeyRelease>", lambda _event: self._redraw_polar())
+            entry.bind("<Return>", lambda _event: self.on_polar())
+
+        self.polar_target = tk.Label(panel, text="", bg=BG, fg=DIM, font=("TkFixedFont", 10))
+        self.polar_target.grid(row=3, column=0, columnspan=4, sticky="w", padx=6)
+
+        ttk.Button(panel, text="GO  (Y first, then X)", command=self.on_polar).grid(
+            row=4, column=0, columnspan=4, sticky="we", padx=6, pady=4
+        )
+
+        self.polar_now = tk.Label(
+            panel, text="", bg=BG, fg=GREEN, font=("TkFixedFont", 14), anchor="w"
+        )
+        self.polar_now.grid(row=5, column=0, columnspan=4, sticky="we", padx=6, pady=(6, 0))
+
+        self.plot = tk.Canvas(panel, width=PLOT_W, height=PLOT_H, bg=LOG_BG, highlightthickness=0)
+        self.plot.grid(row=6, column=0, columnspan=4, padx=6, pady=6)
+        tk.Label(
+            panel,
+            text="top view · green = now · red = target · amber = path\n"
+            "Z is never moved by a polar move.",
+            bg=BG,
+            fg=DIM,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+
     # -- events -------------------------------------------------------------
     def _vel_for(self, axis: str) -> int | None:
         """The velocity entry as an int, after the over-ceiling confirmation.
@@ -481,6 +627,57 @@ class App:
         # message leaves a window in which a second click queues a second move.
         self._set_busy(True)
         self.worker.submit("move", axis=axis, steps=target, vel=vel, absolute=absolute)
+
+    def _read_polar(self) -> tuple[float, float] | None:
+        """(r, phi) from the entries, or None if either is missing or invalid."""
+        try:
+            r = float(self.r_entry.get())
+            phi = float(self.phi_entry.get())
+        except ValueError:
+            return None
+        if r < 0 or not PHI_MIN <= phi <= PHI_MAX or not math.isfinite(r):
+            return None
+        return r, phi
+
+    def on_polar(self) -> None:
+        if not self.worker.is_alive():
+            self._log("not connected: nothing to send to", "err")
+            return
+        if self.worker.abort.is_set():
+            self._log("STOP is latched — press 'reset STOP latch' first", "warn")
+            return
+        if self.busy:
+            self._log("a move is already running", "warn")
+            return
+        polar = self._read_polar()
+        if polar is None:
+            self._log(f"polar: need r >= 0 mm and {PHI_MIN:.0f} <= φ <= {PHI_MAX:.0f} deg", "err")
+            return
+        r, phi = polar
+        x_mm, y_mm = polar_to_xy(r, phi)
+        x_steps = round(x_mm * STEPS_PER_MM["X"])
+        y_steps = round(y_mm * STEPS_PER_MM["Y"])
+
+        vel_y = self._vel_for("Y")
+        if vel_y is None:
+            return
+        vel_x = self._vel_for("X")
+        if vel_x is None:
+            return
+
+        dy = y_mm - self.steps["Y"] / STEPS_PER_MM["Y"]
+        dx = x_mm - self.steps["X"] / STEPS_PER_MM["X"]
+        if max(abs(dx), abs(dy)) > CONFIRM_OVER_MM and not messagebox.askyesno(
+            "Large move",
+            f"Polar move to r = {r:.1f} mm, φ = {phi:+.2f}°\n\n"
+            f"  1) Y by {dy:+.1f} mm\n  2) X by {dx:+.1f} mm\n\n"
+            f"There are no limit switches on this machine and no encoder! "
+            f"If there is no space it will run into a hard stop!\n\nProceed?",
+        ):
+            return
+        self._log(f"polar: r {r:.1f} mm, φ {phi:+.2f}° -> x {x_mm:+.3f}, y {y_mm:+.3f} mm")
+        self._set_busy(True)  # on the Tk thread, closes the double-click window
+        self.worker.submit("polar", x_steps=x_steps, y_steps=y_steps, vel_x=vel_x, vel_y=vel_y)
 
     def on_toggle_dry(self) -> None:
         self.worker.submit("arm", live=not self.simulate.get())
@@ -551,6 +748,88 @@ class App:
         except queue.Empty:
             pass
         self.root.after(DRAIN_INTERVAL_MS, self._drain)
+        self._redraw_polar()
+
+    # -- polar display ------------------------------------------------------
+    def _now_mm(self) -> tuple[float, float]:
+        return self.steps["X"] / STEPS_PER_MM["X"], self.steps["Y"] / STEPS_PER_MM["Y"]
+
+    def _redraw_polar(self) -> None:
+        x_now, y_now = self._now_mm()
+        r_now, phi_now = xy_to_polar(x_now, y_now)
+        if r_now < 0.005:
+            self.polar_now.configure(text="now   r   0.000 mm   φ    —", fg=GREEN)
+        else:
+            outside = abs(phi_now) > PHI_MAX
+            self.polar_now.configure(
+                text=f"now   r {r_now:9.3f} mm   φ {phi_now:+8.3f}°"
+                + ("   (+Y side)" if outside else ""),
+                fg=AMBER if outside else GREEN,
+            )
+
+        polar = self._read_polar()
+        target = polar_to_xy(*polar) if polar else None
+        if target:
+            self.polar_target.configure(
+                text=f"target  x {target[0]:+10.3f} mm   y {target[1]:+10.3f} mm", fg=DIM
+            )
+        elif self.r_entry.get().strip() or self.phi_entry.get().strip():
+            self.polar_target.configure(text="target  (invalid r or φ)", fg=RED_HOT)
+        else:
+            self.polar_target.configure(text="target  —", fg=DIM)
+
+        self._draw_plot((x_now, y_now), target, polar[0] if polar else None)
+
+    def _draw_plot(
+        self,
+        now: tuple[float, float],
+        target: tuple[float, float] | None,
+        r_target: float | None,
+    ) -> None:
+        c = self.plot
+        c.delete("all")
+        extent = max(PLOT_MIN_EXTENT_MM, abs(now[0]), abs(now[1]))
+        if target:
+            extent = max(extent, abs(target[0]), abs(target[1]), r_target or 0.0)
+        extent *= 1.15
+        cx, cy = PLOT_W / 2, PLOT_H / 2
+        scale = (min(PLOT_W, PLOT_H) / 2 - 12) / extent
+
+        def px(x: float, y: float) -> tuple[float, float]:
+            return cx + x * scale, cy - y * scale  # +X right, +Y up
+
+        # axes
+        c.create_line(0, cy, PLOT_W, cy, fill="#3a3a3a")
+        c.create_line(cx, 0, cx, PLOT_H, fill="#3a3a3a")
+        c.create_text(PLOT_W - 4, cy - 8, text="+X (N)", fill=DIM, anchor="e")
+        c.create_text(cx + 4, PLOT_H - 4, text="−Y  φ=0", fill=DIM, anchor="sw")
+        c.create_text(cx + 4, 4, text="+Y (W)", fill=DIM, anchor="nw")
+        c.create_text(4, 4, text=f"±{extent:.0f} mm", fill=DIM, anchor="nw")
+
+        if target and r_target:
+            rr = r_target * scale
+            c.create_arc(
+                cx - rr,
+                cy - rr,
+                cx + rr,
+                cy + rr,
+                start=180,
+                extent=180,
+                style="arc",
+                outline="#555555",
+                dash=(3, 3),
+            )
+            # planned L path: Y leg first, then X leg
+            p0, p1, p2 = px(*now), px(now[0], target[1]), px(*target)
+            c.create_line(*p0, *p1, *p2, fill=AMBER, dash=(5, 3), width=2, arrow="last")
+            c.create_line(cx, cy, *p2, fill="#555555")
+            x, y = p2
+            c.create_line(x - 6, y - 6, x + 6, y + 6, fill=RED_HOT, width=2)
+            c.create_line(x - 6, y + 6, x + 6, y - 6, fill=RED_HOT, width=2)
+
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=FG, outline="")
+        x, y = px(*now)
+        c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=GREEN, outline="")
 
 
 if __name__ == "__main__":
